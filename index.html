@@ -169,6 +169,27 @@
   .conn-banner.show{display:flex;}
   .conn-dot{width:7px; height:7px; border-radius:50%; background:var(--alert); flex:0 0 auto;}
 
+  .sync-status{
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+    font-size:10.5px; color:#dce8dd; margin-top:6px; min-height:16px;
+  }
+  .sync-status .sync-dot{
+    width:7px; height:7px; border-radius:50%; flex:0 0 auto;
+    background:#9fb5a2;
+  }
+  .sync-status.state-read .sync-dot,
+  .sync-status.state-write .sync-dot{ background:#e2c466; }
+  .sync-status.state-ok .sync-dot{ background:#a6d6ab; }
+  .sync-status.state-error .sync-dot,
+  .sync-status.state-offline .sync-dot{ background:var(--alert); }
+  .sync-status .sync-label{ font-weight:700; }
+  .sync-status .sync-detail{ opacity:.78; }
+  .diag-grid{ display:grid; grid-template-columns:minmax(92px,.8fr) minmax(0,1.6fr); gap:6px 10px; font-size:12px; line-height:1.55; }
+  .diag-grid .k{ color:var(--ink-soft); }
+  .diag-grid .v{ color:var(--ink); min-width:0; overflow-wrap:anywhere; }
+  .diag-section{ font-family:"Zen Maru Gothic",sans-serif; font-weight:700; font-size:13px; color:var(--soil-800); margin:14px 0 7px; }
+  .diag-note{ font-size:11px; color:var(--ink-soft); line-height:1.55; margin-top:10px; }
+
   main{padding:12px 16px 16px; max-width:640px; margin:0 auto;}
 
   /* ---- 過去記録閲覧中バナー ---- */
@@ -739,6 +760,11 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   </div>
 
   <div class="conn-banner" id="connBanner"><span class="conn-dot"></span><span id="connBannerText">オフラインです。通信が回復すると自動的に同期されます</span></div>
+  <div class="sync-status state-read" id="syncStatus" aria-live="polite">
+    <span class="sync-dot"></span>
+    <span class="sync-label" id="syncStatusLabel">接続準備中</span>
+    <span class="sync-detail" id="syncStatusDetail"></span>
+  </div>
 </header>
 
 <main id="main"></main>
@@ -874,6 +900,20 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   </div>
 </div>
 
+
+<div class="modal-overlay" id="devDiagModal">
+  <div class="modal-sheet">
+    <div class="modal-title">Developer Diagnostics</div>
+    <div class="modal-sub">通信・Firestore処理の状態を確認します</div>
+    <div id="devDiagBody"></div>
+    <div style="display:flex; gap:8px; margin-top:14px;">
+      <button class="modal-close" id="devDiagRefresh" style="margin-top:0; flex:1;">更新</button>
+      <button class="modal-close" id="devDiagCopy" style="margin-top:0; flex:1;">コピー</button>
+    </div>
+    <button class="modal-close" id="devDiagClose">閉じる</button>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <!-- Firebase SDK (compat版。設定は下部スクリプト内 firebaseConfig を参照) -->
@@ -996,7 +1036,260 @@ function withTimeout(promise, ms, tag){
 // バック)に処理を戻す。
 const FS_OP_TIMEOUT_MS = 6000;
 function withDbTimeout(promise, tag){
-  return withTimeout(promise, FS_OP_TIMEOUT_MS, tag);
+  const token = syncOpStart(tag);
+  // Promise本体にも監視を付ける。ATLAS側でタイムアウトしてもFirestore処理自体は
+  // 後から完了する場合があるため、その「遅れて完了した」事実も診断へ反映する。
+  Promise.resolve(promise).then(
+    result=>syncOpPromiseSettled(token, true, result, null),
+    err=>syncOpPromiseSettled(token, false, null, err)
+  );
+  return withTimeout(promise, FS_OP_TIMEOUT_MS, tag).catch(err=>{
+    if(err && err.isTimeout) syncOpTimedOut(token, err);
+    throw err;
+  });
+}
+
+/* ---------- DEV: 同期状態・通信診断 ---------- */
+const syncDiag = {
+  seq:0,
+  active:new Map(),
+  activeReads:0,
+  activeWrites:0,
+  timedOutReads:0,
+  timedOutWrites:0,
+  lastServerConfirmAt:null,
+  lastReadSuccessAt:null,
+  lastWriteSuccessAt:null,
+  lastErrorAt:null,
+  lastError:null,
+  recent:[],
+  areas:{}
+};
+
+function syncClassifyTag(tag){
+  tag = String(tag || "unknown");
+  const lower = tag.toLowerCase();
+  let type = "other";
+  if(lower.includes("-get-")) type = "read";
+  else if(lower.includes("-set-") || lower.includes("-update-") || lower.includes("-delete-") || lower.includes("-transaction-")) type = "write";
+
+  let area = "other";
+  if(lower.includes("structure")) area="栽培構成";
+  else if(lower.includes("todaychecks") || lower.includes("historychecks") || lower.includes("datestats") || lower.includes("prunechecks")) area="栽培チェック";
+  else if(lower.includes("calendar") || lower.includes("assignee")) area="カレンダー";
+  else if(lower.includes("preference") || lower.includes("pref")) area="希望表";
+  else if(lower.includes("roster")) area="名簿";
+  else if(lower.includes("score")) area="スコア";
+  else if(lower.includes("special")) area="特例日";
+  else if(lower.includes("backup") || lower.includes("restore")) area="バックアップ";
+  else if(lower.includes("admin") || lower.includes("passcode")) area="認証設定";
+  else if(lower.includes("fiscal") || lower.includes("period")) area="年度設定";
+  return {type, area, tag};
+}
+function syncEnsureArea(area){
+  if(!syncDiag.areas[area]){
+    syncDiag.areas[area] = {
+      lastReadSuccessAt:null, lastWriteSuccessAt:null, lastServerConfirmAt:null,
+      lastErrorAt:null, lastError:null, lastDurationMs:null, lastTag:null
+    };
+  }
+  return syncDiag.areas[area];
+}
+function syncOpStart(tag){
+  const meta = syncClassifyTag(tag);
+  const token = {
+    id:++syncDiag.seq, tag:meta.tag, type:meta.type, area:meta.area,
+    startedAt:Date.now(), timedOut:false, settled:false
+  };
+  syncDiag.active.set(token.id, token);
+  if(token.type==="read") syncDiag.activeReads++;
+  if(token.type==="write") syncDiag.activeWrites++;
+  renderSyncStatus();
+  return token;
+}
+function syncRecordRecent(token, status, extra){
+  syncDiag.recent.unshift({
+    at:Date.now(), tag:token.tag, type:token.type, area:token.area,
+    status, durationMs:Date.now()-token.startedAt, extra:extra || ""
+  });
+  if(syncDiag.recent.length>20) syncDiag.recent.length=20;
+}
+function syncOpTimedOut(token, err){
+  if(!token || token.settled || token.timedOut) return;
+  token.timedOut = true;
+  if(token.type==="read") syncDiag.timedOutReads++;
+  if(token.type==="write") syncDiag.timedOutWrites++;
+  syncDiag.lastErrorAt = Date.now();
+  syncDiag.lastError = token.tag + ": timeout";
+  const a = syncEnsureArea(token.area);
+  a.lastErrorAt = syncDiag.lastErrorAt;
+  a.lastError = "timeout";
+  a.lastTag = token.tag;
+  syncRecordRecent(token, "timeout", "処理本体はまだ完了する可能性あり");
+  renderSyncStatus();
+}
+function syncOpPromiseSettled(token, ok, result, err){
+  if(!token || token.settled) return;
+  token.settled = true;
+  syncDiag.active.delete(token.id);
+  if(token.type==="read") syncDiag.activeReads=Math.max(0,syncDiag.activeReads-1);
+  if(token.type==="write") syncDiag.activeWrites=Math.max(0,syncDiag.activeWrites-1);
+  if(token.timedOut){
+    if(token.type==="read") syncDiag.timedOutReads=Math.max(0,syncDiag.timedOutReads-1);
+    if(token.type==="write") syncDiag.timedOutWrites=Math.max(0,syncDiag.timedOutWrites-1);
+  }
+
+  const now=Date.now();
+  const area=syncEnsureArea(token.area);
+  area.lastDurationMs=now-token.startedAt;
+  area.lastTag=token.tag;
+
+  if(ok){
+    if(token.type==="read"){
+      syncDiag.lastReadSuccessAt=now;
+      area.lastReadSuccessAt=now;
+      // get()のSnapshotが明示的にサーバー由来だった時だけ「サーバー確認」と記録する。
+      if(result && result.metadata && result.metadata.fromCache===false){
+        syncDiag.lastServerConfirmAt=now;
+        area.lastServerConfirmAt=now;
+      }
+    }else if(token.type==="write"){
+      // Firestore write Promiseの正常resolveはバックエンド受領後。
+      syncDiag.lastWriteSuccessAt=now;
+      area.lastWriteSuccessAt=now;
+    }
+    syncRecordRecent(token, token.timedOut ? "late-success" : "success");
+  }else{
+    syncDiag.lastErrorAt=now;
+    syncDiag.lastError=token.tag + ": " + ((err && (err.code||err.message)) || "error");
+    area.lastErrorAt=now;
+    area.lastError=(err && (err.code||err.message)) || "error";
+    syncRecordRecent(token, token.timedOut ? "late-error" : "error", area.lastError);
+  }
+  renderSyncStatus();
+}
+function syncMarkSnapshot(areaName, snap){
+  const now=Date.now();
+  const area=syncEnsureArea(areaName);
+  area.lastReadSuccessAt=now;
+  area.lastTag="onSnapshot";
+  syncDiag.lastReadSuccessAt=now;
+  if(snap && snap.metadata && snap.metadata.fromCache===false){
+    area.lastServerConfirmAt=now;
+    syncDiag.lastServerConfirmAt=now;
+  }
+  renderSyncStatus();
+}
+function syncMarkSnapshotError(areaName, err){
+  const now=Date.now();
+  const area=syncEnsureArea(areaName);
+  area.lastErrorAt=now;
+  area.lastError=(err && (err.code||err.message)) || "snapshot error";
+  area.lastTag="onSnapshot";
+  syncDiag.lastErrorAt=now;
+  syncDiag.lastError=areaName + ": " + area.lastError;
+  renderSyncStatus();
+}
+function syncFmtTime(ms, withSeconds){
+  if(!ms) return "—";
+  try{
+    return new Date(ms).toLocaleTimeString("ja-JP", {
+      hour:"2-digit", minute:"2-digit", second:withSeconds?"2-digit":undefined
+    });
+  }catch(_){ return "—"; }
+}
+function renderSyncStatus(){
+  const wrap=document.getElementById("syncStatus");
+  const label=document.getElementById("syncStatusLabel");
+  const detail=document.getElementById("syncStatusDetail");
+  if(!wrap || !label || !detail) return;
+
+  let state="ok", labelText="接続待機";
+  if(!navigator.onLine){
+    state="offline"; labelText="オフライン";
+  }else if(!firebaseReady){
+    state="read"; labelText="接続準備中";
+  }else if(syncDiag.timedOutWrites>0){
+    state="error"; labelText="保存確認待ち";
+  }else if(syncDiag.activeWrites>0){
+    state="write"; labelText="保存中";
+  }else if(syncDiag.timedOutReads>0){
+    state="error"; labelText="読込確認待ち";
+  }else if(syncDiag.activeReads>0){
+    state="read"; labelText="読込中";
+  }else if(syncDiag.lastErrorAt && (!syncDiag.lastServerConfirmAt || syncDiag.lastErrorAt > syncDiag.lastServerConfirmAt)){
+    state="error"; labelText="通信エラーあり";
+  }else{
+    state="ok"; labelText="接続待機";
+  }
+
+  wrap.className="sync-status state-"+state;
+  label.textContent=labelText;
+  if(syncDiag.lastServerConfirmAt){
+    detail.textContent="サーバー確認 "+syncFmtTime(syncDiag.lastServerConfirmAt,false);
+  }else if(syncDiag.lastReadSuccessAt || syncDiag.lastWriteSuccessAt){
+    detail.textContent="通信成功 "+syncFmtTime(Math.max(syncDiag.lastReadSuccessAt||0,syncDiag.lastWriteSuccessAt||0),false);
+  }else{
+    detail.textContent="";
+  }
+}
+function syncDiagText(){
+  const rows=[];
+  rows.push("環境: ATLAS DEVELOPER BETA");
+  rows.push("通信: "+(navigator.onLine?"オンライン":"オフライン"));
+  rows.push("Firebase: "+(firebaseReady?"接続済み":"未接続"));
+  rows.push("読込処理中: "+syncDiag.activeReads);
+  rows.push("保存処理中: "+syncDiag.activeWrites);
+  rows.push("タイムアウト後確認待ち(読込): "+syncDiag.timedOutReads);
+  rows.push("タイムアウト後確認待ち(保存): "+syncDiag.timedOutWrites);
+  rows.push("最終サーバー確認: "+syncFmtTime(syncDiag.lastServerConfirmAt,true));
+  rows.push("最終読込成功: "+syncFmtTime(syncDiag.lastReadSuccessAt,true));
+  rows.push("最終保存成功: "+syncFmtTime(syncDiag.lastWriteSuccessAt,true));
+  rows.push("最終エラー: "+(syncDiag.lastError ? syncFmtTime(syncDiag.lastErrorAt,true)+" "+syncDiag.lastError : "—"));
+  rows.push("");
+  rows.push("[系統別]");
+  Object.keys(syncDiag.areas).sort().forEach(name=>{
+    const a=syncDiag.areas[name];
+    rows.push(name+": server="+syncFmtTime(a.lastServerConfirmAt,true)+
+      " read="+syncFmtTime(a.lastReadSuccessAt,true)+
+      " write="+syncFmtTime(a.lastWriteSuccessAt,true)+
+      " duration="+(a.lastDurationMs==null?"—":a.lastDurationMs+"ms")+
+      (a.lastError ? " error="+a.lastError : ""));
+  });
+  rows.push("");
+  rows.push("[直近処理]");
+  syncDiag.recent.slice(0,10).forEach(r=>{
+    rows.push(syncFmtTime(r.at,true)+" "+r.area+" "+r.status+" "+r.durationMs+"ms "+r.tag+(r.extra?" / "+r.extra:""));
+  });
+  rows.push("");
+  rows.push("User Agent: "+navigator.userAgent);
+  return rows.join("\n");
+}
+function renderDevDiagnostics(){
+  const body=document.getElementById("devDiagBody");
+  if(!body) return;
+  const areaRows=Object.keys(syncDiag.areas).sort().map(name=>{
+    const a=syncDiag.areas[name];
+    const status = a.lastError && (!a.lastServerConfirmAt || a.lastErrorAt>a.lastServerConfirmAt)
+      ? "エラー: "+a.lastError
+      : "最終サーバー確認 "+syncFmtTime(a.lastServerConfirmAt,true);
+    return `<div class="k">${escapeHtml(name)}</div><div class="v">${escapeHtml(status)}${a.lastDurationMs!=null?` / ${a.lastDurationMs}ms`:""}</div>`;
+  }).join("");
+  body.innerHTML = `
+    <div class="diag-grid">
+      <div class="k">通信</div><div class="v">${navigator.onLine?"オンライン":"オフライン"}</div>
+      <div class="k">Firebase</div><div class="v">${firebaseReady?"接続済み":"未接続"}</div>
+      <div class="k">読込処理中</div><div class="v">${syncDiag.activeReads}</div>
+      <div class="k">保存処理中</div><div class="v">${syncDiag.activeWrites}</div>
+      <div class="k">確認待ち</div><div class="v">読込 ${syncDiag.timedOutReads} / 保存 ${syncDiag.timedOutWrites}</div>
+      <div class="k">サーバー確認</div><div class="v">${syncFmtTime(syncDiag.lastServerConfirmAt,true)}</div>
+      <div class="k">読込成功</div><div class="v">${syncFmtTime(syncDiag.lastReadSuccessAt,true)}</div>
+      <div class="k">保存成功</div><div class="v">${syncFmtTime(syncDiag.lastWriteSuccessAt,true)}</div>
+      <div class="k">最終エラー</div><div class="v">${escapeHtml(syncDiag.lastError || "—")}</div>
+    </div>
+    <div class="diag-section">系統別</div>
+    <div class="diag-grid">${areaRows || '<div class="k">記録</div><div class="v">まだありません</div>'}</div>
+    <div class="diag-note">「サーバー確認」は、Snapshotの fromCache=false を確認できた時だけ記録します。「読込成功」はそれより広い意味の通信成功で、最新データ保証とは表示しません。</div>`;
 }
 // タブ切り替え時など「失敗すると表示が崩れる/固まる」重要な読み込みは、
 // 1回タイムアウトしただけで諦めず、少し間をおいて1回だけ再試行する。
@@ -1102,6 +1395,7 @@ function updateConnBanner(){
   }else{
     banner.classList.remove("show");
   }
+  renderSyncStatus();
 }
 function flashConnError(msg){
   const banner = document.getElementById("connBanner");
@@ -1645,18 +1939,21 @@ function unsubscribeAll(){
 function subscribeStructure(tab){
   if(!firebaseReady) return;
   unsubStructure = structureRef(tab).onSnapshot((snap)=>{
+    syncMarkSnapshot("栽培構成", snap);
     if(snap.metadata.hasPendingWrites) return; // 自分自身の書き込みは無視（二重再描画防止）
     if(snap.exists && snap.data() && snap.data().sections){
       structures[tab] = snap.data().sections;
       if(tab===currentTab){ render(); updateUndoBtn(); }
     }
   }, (err)=>{
+    syncMarkSnapshotError("栽培構成", err);
     flashConnError("リアルタイム同期でエラーが発生しました");
   });
 }
 function subscribeChecks(tab){
   if(!firebaseReady) return;
   unsubChecks = checksRef(tab, todayStr).onSnapshot((snap)=>{
+    syncMarkSnapshot("栽培チェック", snap);
     if(snap.metadata.hasPendingWrites) return;
     todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
     todayCheckedCache[tab] = todayChecked;
@@ -1666,6 +1963,7 @@ function subscribeChecks(tab){
       render();
     }
   }, (err)=>{
+    syncMarkSnapshotError("栽培チェック", err);
     flashConnError("リアルタイム同期でエラーが発生しました");
   });
 }
@@ -4398,6 +4696,27 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
     })();
   }
 
+  // DEV診断画面
+  const devDiagBtn=document.getElementById("devDiagBtn");
+  if(devDiagBtn) devDiagBtn.addEventListener("click", ()=>{
+    renderDevDiagnostics();
+    document.getElementById("devDiagModal").classList.add("show");
+  });
+  const devDiagRefresh=document.getElementById("devDiagRefresh");
+  if(devDiagRefresh) devDiagRefresh.addEventListener("click", renderDevDiagnostics);
+  const devDiagClose=document.getElementById("devDiagClose");
+  if(devDiagClose) devDiagClose.addEventListener("click", ()=>document.getElementById("devDiagModal").classList.remove("show"));
+  const devDiagCopy=document.getElementById("devDiagCopy");
+  if(devDiagCopy) devDiagCopy.addEventListener("click", async ()=>{
+    try{
+      await navigator.clipboard.writeText(syncDiagText());
+      showToast("診断情報をコピーしました");
+    }catch(e){
+      showToast("診断情報をコピーできませんでした");
+    }
+  });
+
+  renderSyncStatus();
   attemptInit(1);
 })();
 </script>
