@@ -997,30 +997,39 @@ function loadPdfLibs(){
 /* =========================================================================
    非常用オフラインモード（読み取り専用）
    ========================================================================= */
-const EMERGENCY_SNAPSHOT_KEY = "atlasEmergencySnapshotV1";
+const EMERGENCY_SNAPSHOT_KEY = "atlasEmergencySnapshotV2";
 const EMERGENCY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const EMERGENCY_WARN_AGE_MS = 6 * 60 * 60 * 1000;
 let emergencyMode = false;
 let emergencySnapshot = null;
 let emergencySaveTimer = null;
 
+/* 各領域が「サーバーから実際に確認できた」時刻を別々に保持する。
+   一部だけ更新された時に、全データが同時刻の最新情報に見える誤認を防ぐ。 */
+const emergencyFresh = {
+  structure:{asa:null,hiru:null,yugata:null},
+  checks:{asa:null,hiru:null,yugata:null},
+  calendar:null,
+  preferences:null,
+  dutyMeta:null
+};
+
 function emergencyClone(v){ try{return JSON.parse(JSON.stringify(v));}catch(e){return null;} }
+function emergencyTouch(kind, tab){
+  const now=Date.now();
+  if(kind==="structure" || kind==="checks"){
+    if(tab) emergencyFresh[kind][tab]=now;
+  }else if(kind in emergencyFresh){
+    emergencyFresh[kind]=now;
+  }
+}
 function emergencySnapshotRead(){
   try{
     const raw=localStorage.getItem(EMERGENCY_SNAPSHOT_KEY);
     if(!raw) return null;
     const data=JSON.parse(raw);
-    return data && data.savedAt ? data : null;
+    return data && data.schema===2 ? data : null;
   }catch(e){ return null; }
-}
-function emergencySnapshotStatus(snapshot=emergencySnapshotRead()){
-  if(!snapshot) return {usable:false,reason:"この端末には非常用データが保存されていません",age:null};
-  const savedAt=Number(snapshot.savedAt||0);
-  const age=Date.now()-savedAt;
-  if(!savedAt || age<0) return {usable:false,reason:"保存日時を確認できないため利用できません",age};
-  if(snapshot.day!==getTodayStr()) return {usable:false,reason:`保存データは${snapshot.day||"別日"}のものです。日付が違うため利用できません`,age};
-  if(age>EMERGENCY_MAX_AGE_MS) return {usable:false,reason:"保存から24時間を超えているため利用できません",age};
-  return {usable:true,reason:age>EMERGENCY_WARN_AGE_MS?"保存から6時間を超えています。内容が古い可能性があります":"利用可能",age};
 }
 function emergencyAgeLabel(age){
   if(age===null || age===undefined || !isFinite(age)) return "—";
@@ -1033,39 +1042,100 @@ function emergencyFormatSavedAt(ms){
   if(!ms) return "—";
   return new Date(ms).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit",second:"2-digit"});
 }
-function updateEmergencyLauncher(){
-  emergencySnapshot=emergencySnapshotRead();
-  const ageEl=document.getElementById("emergencySnapshotAge");
-  if(!ageEl) return;
-  const st=emergencySnapshotStatus(emergencySnapshot);
-  ageEl.textContent=emergencySnapshot
-    ? `保存 ${emergencyFormatSavedAt(emergencySnapshot.savedAt)}（${emergencyAgeLabel(st.age)}）`
-    : "非常用データなし";
+function emergencyAtStatus(at){
+  const savedAt=Number(at||0);
+  const age=Date.now()-savedAt;
+  if(!savedAt || age<0) return {usable:false,warn:false,age,reason:"保存日時を確認できません"};
+  const savedDay=new Date(savedAt).toLocaleDateString("sv-SE");
+  if(savedDay!==getTodayStr()) return {usable:false,warn:true,age,reason:"今日のデータではありません"};
+  if(age>EMERGENCY_MAX_AGE_MS) return {usable:false,warn:true,age,reason:"保存から24時間を超えています"};
+  return {usable:true,warn:age>EMERGENCY_WARN_AGE_MS,age,reason:age>EMERGENCY_WARN_AGE_MS?"6時間を超えており古い可能性があります":"利用可能"};
+}
+function emergencyDomainStatus(snapshot=emergencySnapshotRead()){
+  const d = snapshot && snapshot.domains ? snapshot.domains : {};
+  const result = {
+    cultivation:{},
+    calendar: emergencyAtStatus(d.calendar && d.calendar.at),
+    preferences: emergencyAtStatus(d.preferences && d.preferences.at),
+    dutyMeta: emergencyAtStatus(d.dutyMeta && d.dutyMeta.at)
+  };
+  ["asa","hiru","yugata"].forEach(tab=>{
+    result.cultivation[tab]=emergencyAtStatus(d.cultivation && d.cultivation[tab] && d.cultivation[tab].at);
+  });
+  return result;
+}
+function emergencySnapshotStatus(snapshot=emergencySnapshotRead()){
+  if(!snapshot) return {usable:false,reason:"この端末には非常用データが保存されていません",domains:null};
+  const domains=emergencyDomainStatus(snapshot);
+  const usableCultivation=Object.values(domains.cultivation).some(x=>x.usable);
+  const usable=usableCultivation || domains.calendar.usable;
+  return {
+    usable,
+    reason:usable?"利用可能":"今日利用できる栽培管理・当番カレンダーの保存データがありません",
+    domains
+  };
+}
+function emergencyCultivationAt(tab){
+  const a=emergencyFresh.structure[tab], b=emergencyFresh.checks[tab];
+  if(!a || !b) return null;
+  return Math.min(a,b);
 }
 function buildEmergencySnapshot(){
-  return {
-    schema:1,savedAt:Date.now(),day:getTodayStr(),
-    structures:emergencyClone(structures||{}),
-    todayCheckedCache:emergencyClone(todayCheckedCache||{}),
-    calendarAssign:emergencyClone(calendarAssign||{}),
-    calendarChanged:emergencyClone(calendarChanged||{}),
-    calendarPrevious:emergencyClone(calendarPrevious||{}),
-    preferences:emergencyClone(preferences||{}),
-    priorities:emergencyClone(priorities||{}),
-    roster:emergencyClone(roster||[]),
-    specialDates:emergencyClone(specialDates||{}),
-    fiscalPresets:emergencyClone(fiscalPresets||[]),
-    selectedPeriodId:selectedPeriodId||null,
-    prefDeadline:emergencyClone(prefDeadline),
-    currentTab,
-    viewDateAssignees:emergencyClone(viewDateAssignees||[])
+  const previous=emergencySnapshotRead();
+  const prevDomains=(previous && previous.domains) ? previous.domains : {};
+  const domains={
+    cultivation: emergencyClone(prevDomains.cultivation||{}),
+    calendar: emergencyClone(prevDomains.calendar||null),
+    preferences: emergencyClone(prevDomains.preferences||null),
+    dutyMeta: emergencyClone(prevDomains.dutyMeta||null)
   };
+
+  ["asa","hiru","yugata"].forEach(tab=>{
+    const at=emergencyCultivationAt(tab);
+    if(at && Array.isArray(structures[tab]) && todayCheckedCache[tab]!==null){
+      domains.cultivation[tab]={
+        at,
+        structure:emergencyClone(structures[tab]),
+        checks:emergencyClone(todayCheckedCache[tab]||{})
+      };
+    }
+  });
+
+  if(emergencyFresh.calendar){
+    domains.calendar={
+      at:emergencyFresh.calendar,
+      assign:emergencyClone(calendarAssign||{}),
+      changed:emergencyClone(calendarChanged||{}),
+      previous:emergencyClone(calendarPrevious||{})
+    };
+  }
+  if(emergencyFresh.preferences){
+    domains.preferences={
+      at:emergencyFresh.preferences,
+      preferences:emergencyClone(preferences||{}),
+      priorities:emergencyClone(priorities||{})
+    };
+  }
+  if(emergencyFresh.dutyMeta){
+    domains.dutyMeta={
+      at:emergencyFresh.dutyMeta,
+      roster:emergencyClone(roster||[]),
+      specialDates:emergencyClone(specialDates||{}),
+      fiscalPresets:emergencyClone(fiscalPresets||[]),
+      selectedPeriodId:selectedPeriodId||null,
+      prefDeadline:emergencyClone(prefDeadline)
+    };
+  }
+
+  return {schema:2,savedAt:Date.now(),day:getTodayStr(),domains};
 }
 function saveEmergencySnapshotNow(){
   if(emergencyMode || !firebaseReady || !navigator.onLine) return;
   try{
     const snap=buildEmergencySnapshot();
-    if(!snap.structures || !Array.isArray(snap.structures[currentTab])) return;
+    const st=emergencySnapshotStatus(snap);
+    // 有効領域が一つもない不完全データでは既存の非常用データを上書きしない。
+    if(!st.usable) return;
     localStorage.setItem(EMERGENCY_SNAPSHOT_KEY,JSON.stringify(snap));
     emergencySnapshot=snap;
     updateEmergencyLauncher();
@@ -1076,12 +1146,37 @@ function scheduleEmergencySnapshotSave(delay=350){
   clearTimeout(emergencySaveTimer);
   emergencySaveTimer=setTimeout(saveEmergencySnapshotNow,delay);
 }
+function updateEmergencyLauncher(){
+  emergencySnapshot=emergencySnapshotRead();
+  const ageEl=document.getElementById("emergencySnapshotAge");
+  if(!ageEl) return;
+  const st=emergencySnapshotStatus(emergencySnapshot);
+  if(!emergencySnapshot){
+    ageEl.textContent="非常用データなし";
+    return;
+  }
+  const usable=[];
+  if(st.domains){
+    ["asa","hiru","yugata"].forEach(tab=>{
+      if(st.domains.cultivation[tab].usable) usable.push({asa:"朝",hiru:"昼",yugata:"夕"}[tab]);
+    });
+    if(st.domains.calendar.usable) usable.push("当番");
+  }
+  ageEl.textContent=usable.length ? `利用可: ${usable.join("・")}` : "利用できる今日のデータなし";
+}
+function emergencyStatusLine(label, stat, at){
+  const state = stat.usable ? (stat.warn ? "注意" : "利用可") : "利用不可";
+  return `<div><b>${escapeHtml(label)}:</b> ${state} ・ ${escapeHtml(emergencyFormatSavedAt(at))}${at?`（${escapeHtml(emergencyAgeLabel(stat.age))}）`:""}${stat.warn?`<br><span style="font-size:10.5px;">${escapeHtml(stat.reason)}</span>`:""}</div>`;
+}
 function emergencyBannerHtml(){
   if(!emergencyMode || !emergencySnapshot) return "";
   const st=emergencySnapshotStatus(emergencySnapshot);
+  const d=emergencySnapshot.domains||{};
+  const calAt=d.calendar&&d.calendar.at;
   return `<div class="emergency-banner">非常用オフラインモード（読み取り専用）
-    <small>保存日時: ${escapeHtml(emergencyFormatSavedAt(emergencySnapshot.savedAt))} ・ ${escapeHtml(emergencyAgeLabel(st.age))}<br>
-    サーバーの最新状態とは異なる可能性があります。編集内容は保存できません。通常運用へ戻るには再読み込みしてください。</small></div>`;
+    <small>サーバーの最新状態とは異なる可能性があります。表示される各領域の保存日時を必ず確認してください。<br>
+    ${calAt?`当番カレンダー: ${escapeHtml(emergencyFormatSavedAt(calAt))}`:"当番カレンダー: 利用可能な保存データなし"}<br>
+    通常運用へ戻るには再読み込みしてください。</small></div>`;
 }
 function openEmergencyModal(){
   emergencySnapshot=emergencySnapshotRead();
@@ -1092,46 +1187,93 @@ function openEmergencyModal(){
     if(!emergencySnapshot){
       box.innerHTML=`<b>利用できません</b><br>${escapeHtml(st.reason)}<br><br>非常用データは通常接続中にATLASが自動保存します。`;
     }else{
-      const warn=st.age>EMERGENCY_WARN_AGE_MS?`<br><b>注意:</b> ${escapeHtml(st.reason)}`:"";
-      box.innerHTML=`<b>保存日時:</b> ${escapeHtml(emergencyFormatSavedAt(emergencySnapshot.savedAt))}<br>
-        <b>経過:</b> ${escapeHtml(emergencyAgeLabel(st.age))}<br>
-        <b>保存日:</b> ${escapeHtml(emergencySnapshot.day||"—")}<br>
-        <b>利用条件:</b> 保存日が今日・保存から24時間以内<br>
-        <b>できること:</b> 栽培管理・当番情報の確認<br>
-        <b>できないこと:</b> チェック、編集、希望入力、保存、復元などサーバーへの変更
-        ${warn}<br><br>${st.usable?"このデータは非常用表示に利用できます。":`<b>利用できません:</b> ${escapeHtml(st.reason)}`}`;
+      const d=emergencySnapshot.domains||{};
+      const s=st.domains;
+      box.innerHTML=
+        `<b>非常用データの状態</b><br>`+
+        emergencyStatusLine("朝管理",s.cultivation.asa,d.cultivation&&d.cultivation.asa&&d.cultivation.asa.at)+
+        emergencyStatusLine("昼管理",s.cultivation.hiru,d.cultivation&&d.cultivation.hiru&&d.cultivation.hiru.at)+
+        emergencyStatusLine("夕管理",s.cultivation.yugata,d.cultivation&&d.cultivation.yugata&&d.cultivation.yugata.at)+
+        emergencyStatusLine("当番カレンダー",s.calendar,d.calendar&&d.calendar.at)+
+        `<br><b>利用条件:</b> 今日取得したデータ・保存から24時間以内<br>`+
+        `<b>6時間超:</b> 古い可能性があるため警告表示<br>`+
+        `<b>できること:</b> 保存済みの栽培管理・当番カレンダーの確認<br>`+
+        `<b>できないこと:</b> チェック、編集、希望入力、保存、復元、管理者変更<br><br>`+
+        (st.usable?"<b>非常用として利用できます。</b>":`<b>利用できません:</b> ${escapeHtml(st.reason)}`);
     }
   }
   if(enter) enter.disabled=!st.usable;
   document.getElementById("emergencyModal")?.classList.add("show");
 }
+function emergencyTabUsable(tab){
+  const st=emergencySnapshotStatus(emergencySnapshot);
+  return !!(st.domains && st.domains.cultivation[tab] && st.domains.cultivation[tab].usable);
+}
+function emergencyCalendarUsable(){
+  const st=emergencySnapshotStatus(emergencySnapshot);
+  return !!(st.domains && st.domains.calendar && st.domains.calendar.usable);
+}
+function emergencyStopPendingLocalWork(){
+  clearTimeout(emergencySaveTimer);
+  try{
+    Object.keys(autoBackupTimers||{}).forEach(k=>clearTimeout(autoBackupTimers[k]));
+  }catch(e){}
+  try{ clearTimeout(dutyAutoBackupState.timer); }catch(e){}
+}
 function enterEmergencyMode(){
   const snap=emergencySnapshotRead();
   const st=emergencySnapshotStatus(snap);
   if(!st.usable){ showToast(st.reason); return; }
+
   emergencySnapshot=snap;
   emergencyMode=true;
-  structures=snap.structures||{};
-  todayCheckedCache=snap.todayCheckedCache||{asa:null,hiru:null,yugata:null};
-  calendarAssign=snap.calendarAssign||{};
-  calendarChanged=snap.calendarChanged||{};
-  calendarPrevious=snap.calendarPrevious||{};
-  preferences=snap.preferences||{};
-  priorities=snap.priorities||{};
-  roster=Array.isArray(snap.roster)?snap.roster:[];
-  specialDates=snap.specialDates||{};
-  fiscalPresets=Array.isArray(snap.fiscalPresets)?snap.fiscalPresets:[];
-  selectedPeriodId=snap.selectedPeriodId||null;
-  prefDeadline=snap.prefDeadline||null;
-  currentTab=snap.currentTab && structures[snap.currentTab] ? snap.currentTab : "asa";
+  emergencyStopPendingLocalWork();
+  unsubscribeAll();
+  isAdmin=false;
+  sessionStorage.removeItem("dutyIsAdmin");
+  editMode=false;
+
+  const d=snap.domains||{};
+  structures={};
+  todayCheckedCache={asa:null,hiru:null,yugata:null};
+  ["asa","hiru","yugata"].forEach(tab=>{
+    const domain=d.cultivation&&d.cultivation[tab];
+    const ds=st.domains.cultivation[tab];
+    if(domain && ds.usable){
+      structures[tab]=emergencyClone(domain.structure||[]);
+      todayCheckedCache[tab]=emergencyClone(domain.checks||{});
+    }
+  });
+
+  if(d.calendar && st.domains.calendar.usable){
+    calendarAssign=emergencyClone(d.calendar.assign||{});
+    calendarChanged=emergencyClone(d.calendar.changed||{});
+    calendarPrevious=emergencyClone(d.calendar.previous||{});
+  }else{
+    calendarAssign={}; calendarChanged={}; calendarPrevious={};
+  }
+  if(d.preferences && st.domains.preferences.usable){
+    preferences=emergencyClone(d.preferences.preferences||{});
+    priorities=emergencyClone(d.preferences.priorities||{});
+  }else{
+    preferences={}; priorities={};
+  }
+  if(d.dutyMeta && st.domains.dutyMeta.usable){
+    roster=emergencyClone(d.dutyMeta.roster||[]);
+    specialDates=emergencyClone(d.dutyMeta.specialDates||{});
+    fiscalPresets=emergencyClone(d.dutyMeta.fiscalPresets||[]);
+    selectedPeriodId=d.dutyMeta.selectedPeriodId||null;
+    prefDeadline=emergencyClone(d.dutyMeta.prefDeadline);
+  }
+
+  currentTab=["asa","hiru","yugata"].find(tab=>emergencyTabUsable(tab)) || "asa";
   todayChecked=todayCheckedCache[currentTab]||{};
   checkedMap=todayChecked;
   viewDate=getTodayStr();
-  viewDateAssignees=snap.viewDateAssignees||calendarAssign[viewDate]||[];
-  editMode=false;
-  isAdmin=false;
+  viewDateAssignees=calendarAssign[viewDate]||[];
   dutyBootstrapLoaded=true;
-  unsubscribeAll();
+  dutySub="calendar";
+
   document.getElementById("emergencyModal")?.classList.remove("show");
   document.getElementById("appLoadingOverlay")?.classList.add("hide");
   document.getElementById("checkModeHeader").style.display="";
@@ -1139,7 +1281,15 @@ function enterEmergencyMode(){
   document.getElementById("main").style.display="";
   document.getElementById("dutyMain").style.display="none";
   document.querySelectorAll("#modeSwitch button").forEach(b=>b.classList.toggle("active",b.dataset.mode==="check"));
-  document.querySelectorAll("#tabNav button").forEach(b=>b.classList.toggle("active",b.dataset.tab===currentTab));
+  document.querySelectorAll("#tabNav button").forEach(b=>{
+    b.classList.toggle("active",b.dataset.tab===currentTab);
+    b.disabled=!emergencyTabUsable(b.dataset.tab);
+  });
+  document.querySelectorAll("#dutySubNav button").forEach(b=>{
+    b.style.display=(b.dataset.dsub==="calendar")?"":"none";
+    b.classList.toggle("active",b.dataset.dsub==="calendar");
+  });
+
   render();
   renderSyncStatus();
   showToast("非常用オフラインモードを開始しました");
@@ -2040,6 +2190,7 @@ async function applyHiruContentFixV2(){
 
 /* ---------- 保存（自動保存） ---------- */
 async function saveStructure(tab){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   try{
     await withDbTimeout(structureRef(tab).set({
@@ -2052,6 +2203,7 @@ async function saveStructure(tab){
   }
 }
 async function transactStructure(tab, mutateFn){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   for(let attempt=1; attempt<=2; attempt++){
     try{
@@ -2078,6 +2230,7 @@ async function transactStructure(tab, mutateFn){
   }
 }
 async function saveChecks(tab){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   const stats = countStats(tab, todayChecked);
   dateStats[todayStr] = stats;
@@ -2103,6 +2256,7 @@ async function saveChecks(tab){
 function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
 
   async function transactChecks(tab, mutateFn){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   // 起動直後など、端末の通信/IndexedDBがまだ本調子でないタイミングでは
   // このトランザクションが単発で失敗することがある。少し間をおいて
@@ -2226,6 +2380,7 @@ async function loadTodayChecks(tab){
     const snap = await withDbTimeoutRetry(()=>checksRef(tab, todayStr).get(), "todayChecks-get-timeout");
     todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
     todayCheckedCache[tab] = todayChecked;
+    emergencyTouch("checks", tab);
   }catch(e){
     // 取得に失敗しても、以前取得済みの状態があれば消さずに表示を維持する。
     todayChecked = todayCheckedCache[tab] || {};
@@ -2255,6 +2410,7 @@ function subscribeStructure(tab){
     if(snap.metadata.hasPendingWrites) return; // 自分自身の書き込みは無視（二重再描画防止）
     if(snap.exists && snap.data() && snap.data().sections){
       structures[tab] = snap.data().sections;
+      if(!snap.metadata.fromCache) emergencyTouch("structure", tab);
       if(tab===currentTab){ render(); updateUndoBtn(); }
     }
   }, (err)=>{
@@ -2269,6 +2425,7 @@ function subscribeChecks(tab){
     if(snap.metadata.hasPendingWrites) return;
     todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
     todayCheckedCache[tab] = todayChecked;
+    if(!snap.metadata.fromCache) emergencyTouch("checks", tab);
     dateStats[todayStr] = (snap.exists && snap.data() && snap.data().stats) ? snap.data().stats : countStats(tab, todayChecked);
         if(tab===currentTab && !isHistoryMode()){
       checkedMap = todayChecked;
@@ -2338,6 +2495,21 @@ function downSvg(){
 
 /* ---------- タブ切り替え／初期ロード ---------- */
 async function loadTab(tab){
+  if(emergencyMode){
+    currentTab=tab;
+    todayStr=getTodayStr();
+    viewDate=todayStr;
+    if(!emergencyTabUsable(tab)){
+      todayChecked={}; checkedMap={};
+      render();
+      return;
+    }
+    todayChecked=todayCheckedCache[tab]||{};
+    checkedMap=todayChecked;
+    viewDateAssignees=calendarAssign[viewDate]||[];
+    render();
+    return;
+  }
   // このタブ読み込みの「世代」を記録。以後、より新しいloadTab呼び出しが
   // 発生していたら（＝タブを連続でタップした等）、この呼び出しの結果は
   // 画面に反映しない。
@@ -2426,7 +2598,12 @@ function render(){
 
   const readOnly = isHistoryMode() || emergencyMode;
 
-  if(readOnly){
+  if(emergencyMode && !emergencyTabUsable(currentTab)){
+    main.insertAdjacentHTML("beforeend", `<div class="empty-note">このタブには今日利用できる非常用データがありません</div>`);
+    return;
+  }
+
+  if(isHistoryMode()){
     const { md, dow } = shortDowLabel(viewDate);
     const banner = document.createElement("div");
     banner.className = "history-banner";
@@ -2948,6 +3125,7 @@ function drawSprout(pct){
 
 /* ---------- backups ---------- */
 async function createBackup(silent){
+  if(emergencyMode) return;
   if(isHistoryMode()) return;
   if(!firebaseReady){ if(!silent) showConfigWarningOnce(); return; }
   try{
@@ -3001,6 +3179,7 @@ async function pruneBackups(tab=currentTab, force=false){
 const AUTO_BACKUP_DEBOUNCE_MS = 4000;
 const autoBackupTimers = {};
 function scheduleAutoBackup(tab){
+  if(emergencyMode) return;
   clearTimeout(autoBackupTimers[tab]);
   autoBackupTimers[tab] = setTimeout(()=>{
     if(tab===currentTab) createBackup(true);
@@ -3233,6 +3412,7 @@ async function changeAdminPassword(){
 let isAdmin  = sessionStorage.getItem("dutyIsAdmin")==="true";
 let myName   = localStorage.getItem("dutyMyName") || "";
 function unlockAdmin(){
+  if(emergencyMode){ showToast("非常用モードでは管理者操作できません"); return false; }
   if(isAdmin) return true;
   const pw = prompt("管理者パスワードを入力してください");
   if(pw===null) return false;
@@ -3369,6 +3549,7 @@ async function loadRoster(){
   }catch(e){ /* オフライン時などはデフォルトのまま */ }
 }
 async function saveRoster(){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   try{ await rosterRef().set({ names: roster }); }catch(e){ toastFail("名簿の保存", e); }
 }
 function openRosterModal(){
@@ -3500,6 +3681,7 @@ async function loadFiscalSettings(){
   }catch(e){ /* オフライン時などは既定値のまま */ }
 }
 async function saveFiscalSettings(){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   try{
     await withDbTimeout(fiscalSettingsRef().set({
       startMonth: fiscalStartMonth,
@@ -3634,6 +3816,7 @@ async function pruneDutyBackups(){
 }
 const dutyAutoBackupState = { timer:null };
 function scheduleDutyAutoBackup(){
+  if(emergencyMode) return;
   clearTimeout(dutyAutoBackupState.timer);
   dutyAutoBackupState.timer = setTimeout(()=>createDutyBackup(true), 4000);
 }
@@ -3923,11 +4106,13 @@ async function loadPreferencesRange(dateStrs, force=false){
       });
       const loadedNow = Date.now();
       dateStrs.forEach(ds=>{ preferencesLoadedAt[ds] = loadedNow; });
+      emergencyTouch("preferences");
       scheduleEmergencySnapshotSave();
     }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
   });
 }
 async function togglePreference(dateStr){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!myName){ openNameModal(()=>togglePreference(dateStr)); return; }
 
   const beforeWants = Object.assign({}, preferences[dateStr] || {});
@@ -3984,6 +4169,7 @@ async function togglePreference(dateStr){
   }
 }
 async function togglePriority(dateStr){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!myName){ openNameModal(()=>togglePriority(dateStr)); return; }
   if(!(preferences[dateStr] && preferences[dateStr][myName])) return;
 
@@ -4046,6 +4232,7 @@ async function loadCalendarRange(dateStrs, force=false){
       });
       const loadedNow = Date.now();
       dateStrs.forEach(ds=>{ calendarLoadedAt[ds] = loadedNow; });
+      emergencyTouch("calendar");
       scheduleEmergencySnapshotSave();
     }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
   });
@@ -4102,6 +4289,7 @@ async function purgeDutyDataForPeriod(period){
   }
 }
 async function saveCalendarDay(dateStr, people, markChanged){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   const prevPeople = calendarAssign[dateStr] || [];
   const prevMarked = !!calendarChanged[dateStr];
   const prevPrevious = calendarPrevious[dateStr] || [];
@@ -4201,6 +4389,8 @@ async function ensureDutyBootstrapLoaded(){
     ]);
     await loadFiscalPresets();
     dutyBootstrapLoaded = true;
+    emergencyTouch("dutyMeta");
+    scheduleEmergencySnapshotSave();
   })();
   try{
     await dutyBootstrapPromise;
@@ -4213,11 +4403,20 @@ async function renderDutyPanel(){
   const el = document.getElementById("dutyMain");
   const topActions = document.getElementById("dutyTopActions");
   if(topActions) topActions.style.display = (!emergencyMode && isAdmin) ? "" : "none";
-  if(dutySub==="pref") await renderPrefPanel(el, emergencyMode);
+  if(emergencyMode){
+    dutySub="calendar";
+    if(!emergencyCalendarUsable()){
+      el.innerHTML=emergencyBannerHtml()+`<div class="empty-note">今日利用できる非常用の当番カレンダーがありません</div>`;
+      return;
+    }
+    await renderCalendarPanel(el);
+    el.insertAdjacentHTML("afterbegin", emergencyBannerHtml());
+    return;
+  }
+  if(dutySub==="pref") await renderPrefPanel(el);
   else if(dutySub==="score") await renderScorePanel(el);
   else await renderCalendarPanel(el);
-  if(emergencyMode) el.insertAdjacentHTML("afterbegin", emergencyBannerHtml());
-  else scheduleEmergencySnapshotSave();
+  scheduleEmergencySnapshotSave();
 }
 
 /* ---- 希望表パネル(今月・来月を分けて表示) ---- */
@@ -4259,7 +4458,7 @@ async function renderPrefPanel(el, skipReload){
   const nextDates = monthDates(nextM.year, nextM.month).list.filter(isDutyDate);
   if(!skipReload) await loadPreferencesRange(thisDates.concat(nextDates));
 
-  const meBar = `
+  const meBar = emergencyMode ? `` : `
     <div class="me-bar">
       現在の入力者: <b>${myName ? escapeHtml(myName) : "未選択"}</b>
       <button id="changeNameBtn">${myName?"変更":"名前を選ぶ"}</button>
@@ -4303,13 +4502,15 @@ async function renderPrefPanel(el, skipReload){
 
   el.innerHTML = meBar + `<div class="duty-section-title"><span class="title-text">休日管理 希望表</span>
     <span class="duty-actions">
-      <button class="lock-btn" id="prefAdminLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>
+      ${emergencyMode ? `` : `<button class="lock-btn" id="prefAdminLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>`}
     </span>
   </div>` + nextBlock + thisBlock;
-  document.getElementById("prefAdminLockBtn").addEventListener("click", ()=>{
+  const prefAdminLockBtnEl=document.getElementById("prefAdminLockBtn");
+  if(prefAdminLockBtnEl) prefAdminLockBtnEl.addEventListener("click", ()=>{
     if(isAdmin) lockAdmin(); else unlockAdmin();
   });
-  document.getElementById("changeNameBtn").addEventListener("click", ()=>openNameModal());
+  const changeNameBtnEl=document.getElementById("changeNameBtn");
+  if(changeNameBtnEl) changeNameBtnEl.addEventListener("click", ()=>openNameModal());
   const prefAllBtnEl = document.getElementById("prefAllBtn");
   if(prefAllBtnEl) prefAllBtnEl.addEventListener("click", async ()=>{
   if(!myName){ openNameModal(()=>renderPrefPanel(el)); return; }
@@ -4408,7 +4609,7 @@ async function renderScorePanel(el){
   el.innerHTML = `
     <div class="duty-section-title"><span class="title-text">スコア</span>
       <span class="duty-actions">
-        <button class="lock-btn" id="adminLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>
+        ${emergencyMode ? `` : `<button class="lock-btn" id="adminLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>`}
       </span>
     </div>
     ${isAdmin ? `
@@ -4430,7 +4631,8 @@ async function renderScorePanel(el){
     </table>
     <div class="empty-note">基本は1日1ポイント、お盆や年末年始などはポイントアップします。集計は${currentPeriod ? periodLabelFor(currentPeriod) : "選択した"}の期間で記録されます</div>
   `;
-  document.getElementById("adminLockBtn").addEventListener("click", ()=>{
+  const adminLockBtnEl=document.getElementById("adminLockBtn");
+  if(adminLockBtnEl) adminLockBtnEl.addEventListener("click", ()=>{
     if(isAdmin) lockAdmin(); else unlockAdmin();
   });
   const rosterBtnEl = document.getElementById("rosterBtn");
@@ -4589,7 +4791,7 @@ async function renderCalendarPanel(el){
   await loadPreferencesRange(allDates.filter(isDutyDate));
     let html = `<div class="duty-section-title"><span class="title-text">当番カレンダー</span>
     <span class="duty-actions">
-      <button class="lock-btn" id="editorLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>
+      ${emergencyMode ? `` : `<button class="lock-btn" id="editorLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>`}
     </span>
   </div>
   ${isAdmin ? `
@@ -4618,7 +4820,8 @@ async function renderCalendarPanel(el){
     html += `</div></div>`;
   });
   el.innerHTML = html;
-  document.getElementById("editorLockBtn").addEventListener("click", ()=>{
+  const editorLockBtnEl=document.getElementById("editorLockBtn");
+  if(editorLockBtnEl) editorLockBtnEl.addEventListener("click", ()=>{
     if(isAdmin) lockAdmin(); else unlockAdmin();
   });
   const monthDataBtnEl = document.getElementById("monthDataBtn");
