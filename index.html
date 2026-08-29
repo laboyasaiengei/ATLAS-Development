@@ -3534,6 +3534,7 @@ function addMonthsYM(year, month, delta){
 }
 function fiscalPresetsRef(){ return db.collection("duty_settings").doc("fiscalPresets"); }
 async function loadFiscalPresets(){
+  return shareInflight(dutyInflight.fiscal, "presets", async ()=>{
   try{
     const snap = await withDbTimeout(fiscalPresetsRef().get(), "fiscalPresets-get-timeout");
     if(snap.exists && Array.isArray(snap.data().list) && snap.data().list.length){
@@ -3544,6 +3545,7 @@ async function loadFiscalPresets(){
       await saveFiscalPresets();
     }
   }catch(e){ /* オフライン時は空のまま */ }
+  });
 }
 async function saveFiscalPresets(){
   try{ await withDbTimeout(fiscalPresetsRef().set({ list: fiscalPresets }), "fiscalPresets-set-timeout"); }
@@ -3870,6 +3872,25 @@ let priorities = {};  // { "YYYY-MM-DD": {name:true,...} } 特に希望してい
 const preferencesLoadedAt = {};
 const calendarLoadedAt = {};
 const DUTY_RANGE_CACHE_MS = 45 * 1000;
+const dutyInflight = {
+  preferences: new Map(),
+  calendar: new Map(),
+  score: new Map(),
+  fiscal: new Map()
+};
+function stableDateRangeKey(dateStrs){
+  return dateStrs.slice().sort().join("|");
+}
+async function shareInflight(map, key, factory){
+  if(map.has(key)) return map.get(key);
+  const p = Promise.resolve().then(factory);
+  map.set(key, p);
+  try{
+    return await p;
+  }finally{
+    if(map.get(key)===p) map.delete(key);
+  }
+}
 function rangeCacheFresh(dateStrs, loadedAt){
   const now = Date.now();
   return dateStrs.length>0 && dateStrs.every(ds=>loadedAt[ds] && (now-loadedAt[ds] < DUTY_RANGE_CACHE_MS));
@@ -3879,29 +3900,32 @@ async function loadPreferencesRange(dateStrs, force=false){
   if(emergencyMode) return;
   if(dateStrs.length === 0) return;
   if(!force && rangeCacheFresh(dateStrs, preferencesLoadedAt)) return;
-  try{
-    const sorted = dateStrs.slice().sort();
-    const startId = sorted[0];
-    const endId = sorted[sorted.length-1];
-    const wanted = new Set(dateStrs);
-    const snap = await withDbTimeout(
-      preferencesCol()
-        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
-        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
-        .get(),
-      "preferencesRange-get-timeout"
-    );
-    dateStrs.forEach(ds=>{ preferences[ds] = {}; priorities[ds] = {}; });
-    snap.forEach(doc=>{
-      if(!wanted.has(doc.id)) return;
-      const data = doc.data();
-      preferences[doc.id] = data.wants || {};
-      priorities[doc.id] = data.priority || {};
-    });
-    const loadedNow = Date.now();
-    dateStrs.forEach(ds=>{ preferencesLoadedAt[ds] = loadedNow; });
-    scheduleEmergencySnapshotSave();
-  }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
+  const key = stableDateRangeKey(dateStrs);
+  return shareInflight(dutyInflight.preferences, key, async ()=>{
+    try{
+      const sorted = dateStrs.slice().sort();
+      const startId = sorted[0];
+      const endId = sorted[sorted.length-1];
+      const wanted = new Set(dateStrs);
+      const snap = await withDbTimeout(
+        preferencesCol()
+          .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
+          .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
+          .get(),
+        "preferencesRange-get-timeout"
+      );
+      dateStrs.forEach(ds=>{ preferences[ds] = {}; priorities[ds] = {}; });
+      snap.forEach(doc=>{
+        if(!wanted.has(doc.id)) return;
+        const data = doc.data();
+        preferences[doc.id] = data.wants || {};
+        priorities[doc.id] = data.priority || {};
+      });
+      const loadedNow = Date.now();
+      dateStrs.forEach(ds=>{ preferencesLoadedAt[ds] = loadedNow; });
+      scheduleEmergencySnapshotSave();
+    }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
+  });
 }
 async function togglePreference(dateStr){
   if(!myName){ openNameModal(()=>togglePreference(dateStr)); return; }
@@ -3998,30 +4022,33 @@ async function loadCalendarRange(dateStrs, force=false){
   if(emergencyMode) return;
   if(dateStrs.length === 0) return;
   if(!force && rangeCacheFresh(dateStrs, calendarLoadedAt)) return;
-  try{
-    const sorted = dateStrs.slice().sort();
-    const startId = sorted[0];
-    const endId = sorted[sorted.length-1];
-    const wanted = new Set(dateStrs);
-    const snap = await withDbTimeout(
-      calendarCol()
-        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
-        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
-        .get(),
-      "calendarRange-get-timeout"
-    );
-    dateStrs.forEach(ds=>{ calendarAssign[ds] = []; calendarChanged[ds] = false; calendarPrevious[ds] = []; });
-    snap.forEach(doc=>{
-      if(!wanted.has(doc.id)) return;
-      const data = doc.data();
-      calendarAssign[doc.id] = Array.isArray(data.people) ? data.people : [];
-      calendarChanged[doc.id] = !!data.changed;
-      calendarPrevious[doc.id] = Array.isArray(data.previousPeople) ? data.previousPeople : [];
-    });
-    const loadedNow = Date.now();
-    dateStrs.forEach(ds=>{ calendarLoadedAt[ds] = loadedNow; });
-    scheduleEmergencySnapshotSave();
-  }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
+  const key = stableDateRangeKey(dateStrs);
+  return shareInflight(dutyInflight.calendar, key, async ()=>{
+    try{
+      const sorted = dateStrs.slice().sort();
+      const startId = sorted[0];
+      const endId = sorted[sorted.length-1];
+      const wanted = new Set(dateStrs);
+      const snap = await withDbTimeout(
+        calendarCol()
+          .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
+          .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
+          .get(),
+        "calendarRange-get-timeout"
+      );
+      dateStrs.forEach(ds=>{ calendarAssign[ds] = []; calendarChanged[ds] = false; calendarPrevious[ds] = []; });
+      snap.forEach(doc=>{
+        if(!wanted.has(doc.id)) return;
+        const data = doc.data();
+        calendarAssign[doc.id] = Array.isArray(data.people) ? data.people : [];
+        calendarChanged[doc.id] = !!data.changed;
+        calendarPrevious[doc.id] = Array.isArray(data.previousPeople) ? data.previousPeople : [];
+      });
+      const loadedNow = Date.now();
+      dateStrs.forEach(ds=>{ calendarLoadedAt[ds] = loadedNow; });
+      scheduleEmergencySnapshotSave();
+    }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
+  });
 }
 const scorePeriodCache = {};
 async function loadCalendarForScorePeriod(period, force=false){
@@ -4034,7 +4061,8 @@ async function loadCalendarForScorePeriod(period, force=false){
   const cacheKey = period.id || `${period.startYear}-${period.startMonth}-${period.endYear}-${period.endMonth}`;
   const cached = scorePeriodCache[cacheKey];
   if(!force && cached && Date.now()-cached.at < DUTY_RANGE_CACHE_MS) return cached.map;
-  try{
+  return shareInflight(dutyInflight.score, cacheKey, async ()=>{
+    try{
     const startId = `${period.startYear}-${pad2(period.startMonth)}-01`;
     const lastDay = new Date(period.endYear, period.endMonth, 0).getDate();
     const endId = `${period.endYear}-${pad2(period.endMonth)}-${pad2(lastDay)}`;
@@ -4050,14 +4078,15 @@ async function loadCalendarForScorePeriod(period, force=false){
       map[doc.id] = Array.isArray(doc.data().people) ? doc.data().people : [];
     });
     scorePeriodCache[cacheKey] = { at: Date.now(), map };
-    return map;
-  }catch(e){
-    const map = {};
-    Object.keys(calendarAssign).forEach(ds=>{
-      if(dateInPeriod(ds, period)) map[ds] = calendarAssign[ds];
-    });
-    return map;
-  }
+      return map;
+    }catch(e){
+      const map = {};
+      Object.keys(calendarAssign).forEach(ds=>{
+        if(dateInPeriod(ds, period)) map[ds] = calendarAssign[ds];
+      });
+      return map;
+    }
+  });
 }
 async function purgeDutyDataForPeriod(period){
   const collections = [preferencesCol(), calendarCol()];
