@@ -178,7 +178,8 @@
     background:#9fb5a2;
   }
   .sync-status.state-read .sync-dot,
-  .sync-status.state-write .sync-dot{ background:#e2c466; }
+  .sync-status.state-write .sync-dot,
+  .sync-status.state-slow .sync-dot{ background:#e2c466; }
   .sync-status.state-ok .sync-dot{ background:#a6d6ab; }
   .sync-status.state-error .sync-dot,
   .sync-status.state-offline .sync-dot{ background:var(--alert); }
@@ -1034,17 +1035,24 @@ function withTimeout(promise, ms, tag){
 // 通信で起こりうるため、起動時に呼ぶ主要なget/set/deleteはすべてこれで
 // 包み、8秒で見切りをつけて呼び出し元の既存のtry/catch(既定値へのフォール
 // バック)に処理を戻す。
-const FS_OP_TIMEOUT_MS = 6000;
+// 6秒は「失敗」ではなく、応答が遅いことを検知するための閾値。
+// 実機検証で10秒前後かかった後に正常完了するケースを確認したため、
+// 本当のタイムアウトは15秒に分離する。
+const FS_OP_SLOW_MS = 6000;
+const FS_OP_HARD_TIMEOUT_MS = 15000;
 function withDbTimeout(promise, tag){
   const token = syncOpStart(tag);
-  // Promise本体にも監視を付ける。ATLAS側でタイムアウトしてもFirestore処理自体は
-  // 後から完了する場合があるため、その「遅れて完了した」事実も診断へ反映する。
+  token.slowTimer = setTimeout(()=>syncOpSlow(token), FS_OP_SLOW_MS);
+
+  // Promise本体を最後まで監視する。ATLAS側で15秒タイムアウトになった後でも
+  // Firestore処理が完了した場合、その「復帰」まで診断へ記録する。
   Promise.resolve(promise).then(
     result=>syncOpPromiseSettled(token, true, result, null),
     err=>syncOpPromiseSettled(token, false, null, err)
   );
-  return withTimeout(promise, FS_OP_TIMEOUT_MS, tag).catch(err=>{
-    if(err && err.isTimeout) syncOpTimedOut(token, err);
+
+  return withTimeout(promise, FS_OP_HARD_TIMEOUT_MS, tag).catch(err=>{
+    if(err && err.isTimeout) syncOpHardTimeout(token, err);
     throw err;
   });
 }
@@ -1055,13 +1063,15 @@ const syncDiag = {
   active:new Map(),
   activeReads:0,
   activeWrites:0,
-  timedOutReads:0,
-  timedOutWrites:0,
+  slowReads:0,
+  slowWrites:0,
+  hardTimedOutReads:0,
+  hardTimedOutWrites:0,
   lastServerConfirmAt:null,
   lastReadSuccessAt:null,
   lastWriteSuccessAt:null,
-  lastErrorAt:null,
-  lastError:null,
+  lastIncidentAt:null,
+  lastIncident:null,
   recent:[],
   areas:{}
 };
@@ -1090,7 +1100,9 @@ function syncEnsureArea(area){
   if(!syncDiag.areas[area]){
     syncDiag.areas[area] = {
       lastReadSuccessAt:null, lastWriteSuccessAt:null, lastServerConfirmAt:null,
-      lastErrorAt:null, lastError:null, lastDurationMs:null, lastTag:null
+      currentErrorAt:null, currentError:null,
+      lastIncidentAt:null, lastIncident:null, recoveredAt:null,
+      lastDurationMs:null, lastTag:null, slowCount:0, hardTimeoutCount:0
     };
   }
   return syncDiag.areas[area];
@@ -1099,7 +1111,7 @@ function syncOpStart(tag){
   const meta = syncClassifyTag(tag);
   const token = {
     id:++syncDiag.seq, tag:meta.tag, type:meta.type, area:meta.area,
-    startedAt:Date.now(), timedOut:false, settled:false
+    startedAt:Date.now(), slow:false, hardTimedOut:false, settled:false, slowTimer:null
   };
   syncDiag.active.set(token.id, token);
   if(token.type==="read") syncDiag.activeReads++;
@@ -1112,31 +1124,57 @@ function syncRecordRecent(token, status, extra){
     at:Date.now(), tag:token.tag, type:token.type, area:token.area,
     status, durationMs:Date.now()-token.startedAt, extra:extra || ""
   });
-  if(syncDiag.recent.length>20) syncDiag.recent.length=20;
+  if(syncDiag.recent.length>30) syncDiag.recent.length=30;
 }
-function syncOpTimedOut(token, err){
-  if(!token || token.settled || token.timedOut) return;
-  token.timedOut = true;
-  if(token.type==="read") syncDiag.timedOutReads++;
-  if(token.type==="write") syncDiag.timedOutWrites++;
-  syncDiag.lastErrorAt = Date.now();
-  syncDiag.lastError = token.tag + ": timeout";
-  const a = syncEnsureArea(token.area);
-  a.lastErrorAt = syncDiag.lastErrorAt;
-  a.lastError = "timeout";
-  a.lastTag = token.tag;
-  syncRecordRecent(token, "timeout", "処理本体はまだ完了する可能性あり");
+function syncSetIncident(area, text){
+  const now=Date.now();
+  syncDiag.lastIncidentAt=now;
+  syncDiag.lastIncident=area+": "+text;
+  const a=syncEnsureArea(area);
+  a.lastIncidentAt=now;
+  a.lastIncident=text;
+}
+function syncOpSlow(token){
+  if(!token || token.settled || token.slow) return;
+  token.slow=true;
+  if(token.type==="read") syncDiag.slowReads++;
+  if(token.type==="write") syncDiag.slowWrites++;
+  const a=syncEnsureArea(token.area);
+  a.slowCount++;
+  a.lastTag=token.tag;
+  syncSetIncident(token.area, "応答遅延（6秒超）");
+  syncRecordRecent(token, "slow", "6秒を超えたため継続監視中");
+  renderSyncStatus();
+}
+function syncOpHardTimeout(token, err){
+  if(!token || token.settled || token.hardTimedOut) return;
+  token.hardTimedOut=true;
+  if(token.type==="read") syncDiag.hardTimedOutReads++;
+  if(token.type==="write") syncDiag.hardTimedOutWrites++;
+  const now=Date.now();
+  const a=syncEnsureArea(token.area);
+  a.hardTimeoutCount++;
+  a.currentErrorAt=now;
+  a.currentError="15秒タイムアウト";
+  a.lastTag=token.tag;
+  syncSetIncident(token.area, "15秒タイムアウト");
+  syncRecordRecent(token, "hard-timeout", "処理本体は引き続き完了する可能性あり");
   renderSyncStatus();
 }
 function syncOpPromiseSettled(token, ok, result, err){
   if(!token || token.settled) return;
-  token.settled = true;
+  token.settled=true;
+  if(token.slowTimer) clearTimeout(token.slowTimer);
   syncDiag.active.delete(token.id);
   if(token.type==="read") syncDiag.activeReads=Math.max(0,syncDiag.activeReads-1);
   if(token.type==="write") syncDiag.activeWrites=Math.max(0,syncDiag.activeWrites-1);
-  if(token.timedOut){
-    if(token.type==="read") syncDiag.timedOutReads=Math.max(0,syncDiag.timedOutReads-1);
-    if(token.type==="write") syncDiag.timedOutWrites=Math.max(0,syncDiag.timedOutWrites-1);
+  if(token.slow){
+    if(token.type==="read") syncDiag.slowReads=Math.max(0,syncDiag.slowReads-1);
+    if(token.type==="write") syncDiag.slowWrites=Math.max(0,syncDiag.slowWrites-1);
+  }
+  if(token.hardTimedOut){
+    if(token.type==="read") syncDiag.hardTimedOutReads=Math.max(0,syncDiag.hardTimedOutReads-1);
+    if(token.type==="write") syncDiag.hardTimedOutWrites=Math.max(0,syncDiag.hardTimedOutWrites-1);
   }
 
   const now=Date.now();
@@ -1148,23 +1186,36 @@ function syncOpPromiseSettled(token, ok, result, err){
     if(token.type==="read"){
       syncDiag.lastReadSuccessAt=now;
       area.lastReadSuccessAt=now;
-      // get()のSnapshotが明示的にサーバー由来だった時だけ「サーバー確認」と記録する。
       if(result && result.metadata && result.metadata.fromCache===false){
         syncDiag.lastServerConfirmAt=now;
         area.lastServerConfirmAt=now;
       }
     }else if(token.type==="write"){
-      // Firestore write Promiseの正常resolveはバックエンド受領後。
       syncDiag.lastWriteSuccessAt=now;
       area.lastWriteSuccessAt=now;
     }
-    syncRecordRecent(token, token.timedOut ? "late-success" : "success");
+
+    // 過去のエラーは履歴として残しつつ、後から成功したら「現在エラー」は解除。
+    if(area.currentError){
+      area.currentError=null;
+      area.currentErrorAt=null;
+      area.recoveredAt=now;
+    }
+    if(token.hardTimedOut){
+      syncSetIncident(token.area, "タイムアウト後に正常復帰");
+      syncRecordRecent(token, "recovered-success", "15秒タイムアウト後に完了");
+    }else if(token.slow){
+      syncSetIncident(token.area, "遅延後に正常完了");
+      syncRecordRecent(token, "slow-success", "6秒超の遅延後に完了");
+    }else{
+      syncRecordRecent(token, "success");
+    }
   }else{
-    syncDiag.lastErrorAt=now;
-    syncDiag.lastError=token.tag + ": " + ((err && (err.code||err.message)) || "error");
-    area.lastErrorAt=now;
-    area.lastError=(err && (err.code||err.message)) || "error";
-    syncRecordRecent(token, token.timedOut ? "late-error" : "error", area.lastError);
+    const msg=(err && (err.code||err.message)) || "error";
+    area.currentErrorAt=now;
+    area.currentError=msg;
+    syncSetIncident(token.area, msg);
+    syncRecordRecent(token, token.hardTimedOut ? "late-error" : "error", msg);
   }
   renderSyncStatus();
 }
@@ -1178,16 +1229,21 @@ function syncMarkSnapshot(areaName, snap){
     area.lastServerConfirmAt=now;
     syncDiag.lastServerConfirmAt=now;
   }
+  if(area.currentError){
+    area.currentError=null;
+    area.currentErrorAt=null;
+    area.recoveredAt=now;
+  }
   renderSyncStatus();
 }
 function syncMarkSnapshotError(areaName, err){
   const now=Date.now();
   const area=syncEnsureArea(areaName);
-  area.lastErrorAt=now;
-  area.lastError=(err && (err.code||err.message)) || "snapshot error";
+  const msg=(err && (err.code||err.message)) || "snapshot error";
+  area.currentErrorAt=now;
+  area.currentError=msg;
   area.lastTag="onSnapshot";
-  syncDiag.lastErrorAt=now;
-  syncDiag.lastError=areaName + ": " + area.lastError;
+  syncSetIncident(areaName, msg);
   renderSyncStatus();
 }
 function syncFmtTime(ms, withSeconds){
@@ -1198,26 +1254,32 @@ function syncFmtTime(ms, withSeconds){
     });
   }catch(_){ return "—"; }
 }
+function syncCurrentErrors(){
+  return Object.keys(syncDiag.areas).filter(name=>!!syncDiag.areas[name].currentError);
+}
 function renderSyncStatus(){
   const wrap=document.getElementById("syncStatus");
   const label=document.getElementById("syncStatusLabel");
   const detail=document.getElementById("syncStatusDetail");
   if(!wrap || !label || !detail) return;
 
+  const currentErrors=syncCurrentErrors();
   let state="ok", labelText="接続待機";
   if(!navigator.onLine){
     state="offline"; labelText="オフライン";
   }else if(!firebaseReady){
     state="read"; labelText="接続準備中";
-  }else if(syncDiag.timedOutWrites>0){
-    state="error"; labelText="保存確認待ち";
+  }else if(syncDiag.hardTimedOutWrites>0 || syncDiag.hardTimedOutReads>0){
+    state="error"; labelText="通信エラー・確認継続中";
+  }else if(syncDiag.slowWrites>0){
+    state="slow"; labelText="保存の応答待ち";
   }else if(syncDiag.activeWrites>0){
     state="write"; labelText="保存中";
-  }else if(syncDiag.timedOutReads>0){
-    state="error"; labelText="読込確認待ち";
+  }else if(syncDiag.slowReads>0){
+    state="slow"; labelText="読込の応答待ち";
   }else if(syncDiag.activeReads>0){
     state="read"; labelText="読込中";
-  }else if(syncDiag.lastErrorAt && (!syncDiag.lastServerConfirmAt || syncDiag.lastErrorAt > syncDiag.lastServerConfirmAt)){
+  }else if(currentErrors.length>0){
     state="error"; labelText="通信エラーあり";
   }else{
     state="ok"; labelText="接続待機";
@@ -1226,70 +1288,111 @@ function renderSyncStatus(){
   wrap.className="sync-status state-"+state;
   label.textContent=labelText;
   if(syncDiag.lastServerConfirmAt){
-    detail.textContent="サーバー確認 "+syncFmtTime(syncDiag.lastServerConfirmAt,false);
+    detail.textContent="最終サーバー確認 "+syncFmtTime(syncDiag.lastServerConfirmAt,false);
   }else if(syncDiag.lastReadSuccessAt || syncDiag.lastWriteSuccessAt){
-    detail.textContent="通信成功 "+syncFmtTime(Math.max(syncDiag.lastReadSuccessAt||0,syncDiag.lastWriteSuccessAt||0),false);
+    detail.textContent="最終通信成功 "+syncFmtTime(Math.max(syncDiag.lastReadSuccessAt||0,syncDiag.lastWriteSuccessAt||0),false);
   }else{
     detail.textContent="";
   }
 }
+function syncDetectClient(){
+  const ua=navigator.userAgent || "";
+  const platform=navigator.platform || "";
+  const touch=Number(navigator.maxTouchPoints || 0);
+  const isIPadUA=/iPad/i.test(ua);
+  const isIPhone=/iPhone/i.test(ua);
+  const isIPadDesktop=(platform==="MacIntel" || /Macintosh/i.test(ua)) && touch>1;
+  let device="その他/不明";
+  if(isIPhone) device="iPhone";
+  else if(isIPadUA || isIPadDesktop) device="iPad / iPadOS系";
+  else if(/Macintosh|Mac OS X/i.test(ua)) device="Mac";
+  else if(/Windows/i.test(ua)) device="Windows PC";
+  else if(/Android/i.test(ua)) device="Android";
+  const safari=(ua.match(/Version\/([\d.]+)/)||[])[1] || "—";
+  const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1] || "—";
+  const os=(ua.match(/(?:CPU (?:iPhone )?OS|iPhone OS) ([\d_]+)/)||[])[1];
+  return {device, safari, webkit, os:os?os.replace(/_/g,"."):"—", platform:platform||"—", touch, ua};
+}
 function syncDiagText(){
   const rows=[];
+  const client=syncDetectClient();
+  const currentErrors=syncCurrentErrors();
   rows.push("環境: ATLAS DEVELOPER BETA");
   rows.push("通信: "+(navigator.onLine?"オンライン":"オフライン"));
   rows.push("Firebase: "+(firebaseReady?"接続済み":"未接続"));
+  rows.push("推定端末: "+client.device);
+  rows.push("OS(UA): "+client.os);
+  rows.push("Safari: "+client.safari+" / WebKit: "+client.webkit);
+  rows.push("Platform: "+client.platform+" / maxTouchPoints: "+client.touch);
   rows.push("読込処理中: "+syncDiag.activeReads);
   rows.push("保存処理中: "+syncDiag.activeWrites);
-  rows.push("タイムアウト後確認待ち(読込): "+syncDiag.timedOutReads);
-  rows.push("タイムアウト後確認待ち(保存): "+syncDiag.timedOutWrites);
+  rows.push("遅延中(読込): "+syncDiag.slowReads);
+  rows.push("遅延中(保存): "+syncDiag.slowWrites);
+  rows.push("15秒タイムアウト後確認待ち(読込): "+syncDiag.hardTimedOutReads);
+  rows.push("15秒タイムアウト後確認待ち(保存): "+syncDiag.hardTimedOutWrites);
+  rows.push("現在エラー: "+(currentErrors.length?currentErrors.map(n=>n+"="+syncDiag.areas[n].currentError).join(" / "):"—"));
   rows.push("最終サーバー確認: "+syncFmtTime(syncDiag.lastServerConfirmAt,true));
   rows.push("最終読込成功: "+syncFmtTime(syncDiag.lastReadSuccessAt,true));
   rows.push("最終保存成功: "+syncFmtTime(syncDiag.lastWriteSuccessAt,true));
-  rows.push("最終エラー: "+(syncDiag.lastError ? syncFmtTime(syncDiag.lastErrorAt,true)+" "+syncDiag.lastError : "—"));
+  rows.push("最終インシデント: "+(syncDiag.lastIncident ? syncFmtTime(syncDiag.lastIncidentAt,true)+" "+syncDiag.lastIncident : "—"));
   rows.push("");
   rows.push("[系統別]");
   Object.keys(syncDiag.areas).sort().forEach(name=>{
     const a=syncDiag.areas[name];
-    rows.push(name+": server="+syncFmtTime(a.lastServerConfirmAt,true)+
+    let state=a.currentError ? "ERROR:"+a.currentError : (a.recoveredAt ? "RECOVERED" : "OK");
+    rows.push(name+": state="+state+
+      " server="+syncFmtTime(a.lastServerConfirmAt,true)+
       " read="+syncFmtTime(a.lastReadSuccessAt,true)+
       " write="+syncFmtTime(a.lastWriteSuccessAt,true)+
       " duration="+(a.lastDurationMs==null?"—":a.lastDurationMs+"ms")+
-      (a.lastError ? " error="+a.lastError : ""));
+      " slow="+a.slowCount+
+      " timeout="+a.hardTimeoutCount+
+      (a.lastIncident ? " incident="+a.lastIncident : ""));
   });
   rows.push("");
   rows.push("[直近処理]");
-  syncDiag.recent.slice(0,10).forEach(r=>{
+  syncDiag.recent.slice(0,12).forEach(r=>{
     rows.push(syncFmtTime(r.at,true)+" "+r.area+" "+r.status+" "+r.durationMs+"ms "+r.tag+(r.extra?" / "+r.extra:""));
   });
   rows.push("");
-  rows.push("User Agent: "+navigator.userAgent);
+  rows.push("User Agent: "+client.ua);
   return rows.join("\n");
 }
 function renderDevDiagnostics(){
   const body=document.getElementById("devDiagBody");
   if(!body) return;
+  const client=syncDetectClient();
+  const currentErrors=syncCurrentErrors();
   const areaRows=Object.keys(syncDiag.areas).sort().map(name=>{
     const a=syncDiag.areas[name];
-    const status = a.lastError && (!a.lastServerConfirmAt || a.lastErrorAt>a.lastServerConfirmAt)
-      ? "エラー: "+a.lastError
-      : "最終サーバー確認 "+syncFmtTime(a.lastServerConfirmAt,true);
-    return `<div class="k">${escapeHtml(name)}</div><div class="v">${escapeHtml(status)}${a.lastDurationMs!=null?` / ${a.lastDurationMs}ms`:""}</div>`;
+    let status="正常";
+    if(a.currentError) status="現在エラー: "+a.currentError;
+    else if(a.recoveredAt) status="正常復帰済み";
+    const detail=[
+      status,
+      "server "+syncFmtTime(a.lastServerConfirmAt,true),
+      a.lastDurationMs!=null?a.lastDurationMs+"ms":null,
+      a.slowCount?"遅延 "+a.slowCount+"回":null,
+      a.hardTimeoutCount?"15秒timeout "+a.hardTimeoutCount+"回":null
+    ].filter(Boolean).join(" / ");
+    return `<div class="k">${escapeHtml(name)}</div><div class="v">${escapeHtml(detail)}</div>`;
   }).join("");
   body.innerHTML = `
     <div class="diag-grid">
       <div class="k">通信</div><div class="v">${navigator.onLine?"オンライン":"オフライン"}</div>
       <div class="k">Firebase</div><div class="v">${firebaseReady?"接続済み":"未接続"}</div>
-      <div class="k">読込処理中</div><div class="v">${syncDiag.activeReads}</div>
-      <div class="k">保存処理中</div><div class="v">${syncDiag.activeWrites}</div>
-      <div class="k">確認待ち</div><div class="v">読込 ${syncDiag.timedOutReads} / 保存 ${syncDiag.timedOutWrites}</div>
-      <div class="k">サーバー確認</div><div class="v">${syncFmtTime(syncDiag.lastServerConfirmAt,true)}</div>
-      <div class="k">読込成功</div><div class="v">${syncFmtTime(syncDiag.lastReadSuccessAt,true)}</div>
-      <div class="k">保存成功</div><div class="v">${syncFmtTime(syncDiag.lastWriteSuccessAt,true)}</div>
-      <div class="k">最終エラー</div><div class="v">${escapeHtml(syncDiag.lastError || "—")}</div>
+      <div class="k">推定端末</div><div class="v">${escapeHtml(client.device)}</div>
+      <div class="k">Safari / WebKit</div><div class="v">${escapeHtml(client.safari)} / ${escapeHtml(client.webkit)}</div>
+      <div class="k">読込 / 保存</div><div class="v">${syncDiag.activeReads} / ${syncDiag.activeWrites}</div>
+      <div class="k">遅延中</div><div class="v">読込 ${syncDiag.slowReads} / 保存 ${syncDiag.slowWrites}</div>
+      <div class="k">15秒超確認待ち</div><div class="v">読込 ${syncDiag.hardTimedOutReads} / 保存 ${syncDiag.hardTimedOutWrites}</div>
+      <div class="k">現在エラー</div><div class="v">${currentErrors.length?escapeHtml(currentErrors.join("、")):"—"}</div>
+      <div class="k">最終サーバー確認</div><div class="v">${syncFmtTime(syncDiag.lastServerConfirmAt,true)}</div>
+      <div class="k">最終インシデント</div><div class="v">${escapeHtml(syncDiag.lastIncident || "—")}</div>
     </div>
     <div class="diag-section">系統別</div>
     <div class="diag-grid">${areaRows || '<div class="k">記録</div><div class="v">まだありません</div>'}</div>
-    <div class="diag-note">「サーバー確認」は、Snapshotの fromCache=false を確認できた時だけ記録します。「読込成功」はそれより広い意味の通信成功で、最新データ保証とは表示しません。</div>`;
+    <div class="diag-note">6秒超は「遅延」として記録し、15秒を超えた場合のみタイムアウト扱いにします。後から正常完了した場合は現在エラーを解除し、履歴だけ残します。「最終サーバー確認」はSnapshotの fromCache=false を確認できた時刻です。</div>`;
 }
 // タブ切り替え時など「失敗すると表示が崩れる/固まる」重要な読み込みは、
 // 1回タイムアウトしただけで諦めず、少し間をおいて1回だけ再試行する。
