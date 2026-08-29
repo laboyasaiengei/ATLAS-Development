@@ -4718,8 +4718,10 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
   // 残るため、起動シーケンス全体にも上限を設け、これを超えたら
   // 「今どこで止まったか」を表示しつつ、1回だけ自動で静かにやり直す。
   // それでもダメならユーザーに再読み込みを促す画面に切り替える。
-  const OVERLAY_HARD_TIMEOUT_MS = 15000;
-  const MAX_ATTEMPTS = 2;
+  // 起動時のFirestore処理はSafari/iPadOSで15〜30秒待った後に正常完了することがある。
+  // そのため15秒で別の初期化処理を重ねない。既存処理をそのまま監視し続ける。
+  const OVERLAY_LONG_WAIT_MS = 15000;
+  const OVERLAY_RELOAD_OPTION_MS = 45000;
   const overlayShownAt = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
 
   const spinnerEl = document.getElementById("appLoadingSpinner");
@@ -4747,56 +4749,83 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
     }
   };
 
-  function attemptInit(attempt){
-    let settled = false; // このattemptが完了 or ウォッチドッグ発火 のどちらかを経たら true
-    const watchdog = setTimeout(()=>{
-      if(settled) return;
-      settled = true;
-      console.error(`起動タイムアウト(${attempt}回目): 「${currentLoadingStepLabel}」の段階で既定時間内に完了しませんでした`);
-      if(attempt < MAX_ATTEMPTS){
-        // 1回目の詰まりは自動で静かにやり直す（この不具合は一時的なことが多いため）
-        attemptInit(attempt + 1);
-      }else{
-        showLoadingErrorScreen(currentLoadingStepLabel);
-      }
-    }, OVERLAY_HARD_TIMEOUT_MS);
+  function attemptInit(){
+    let settled = false;
 
-    const attemptTag = attempt > 1 ? `（${attempt}回目）` : "";
+    // 15秒では「失敗」とみなさない。現在の処理を重ねず、そのまま待つ。
+    const longWaitTimer = setTimeout(()=>{
+      if(settled) return;
+      console.warn(`起動処理が15秒を超えて継続中: 「${currentLoadingStepLabel}」`);
+      if(textEl) textEl.textContent = "サーバー応答を待っています…";
+      if(stepEl) stepEl.textContent = `${currentLoadingStepLabel}（15秒超・処理継続中）`;
+    }, OVERLAY_LONG_WAIT_MS);
+
+    // 45秒を超えた場合だけ、ユーザーに再読み込みという選択肢を提示する。
+    // 背後の初期化処理自体は止めず、後から正常完了すればそのまま起動する。
+    const reloadOptionTimer = setTimeout(()=>{
+      if(settled) return;
+      console.warn(`起動処理が45秒を超えて継続中: 「${currentLoadingStepLabel}」`);
+      if(errorBox) errorBox.style.display = "flex";
+      if(errorDetailEl){
+        errorDetailEl.textContent =
+          `「${currentLoadingStepLabel}」でサーバー応答待ちが続いています。\n` +
+          `処理は継続しています。そのまま待つか、必要な場合だけ再読み込みしてください。`;
+      }
+    }, OVERLAY_RELOAD_OPTION_MS);
 
     (async ()=>{
       try{
-        setLoadingStep("Firebaseに接続中…" + attemptTag);
+        setLoadingStep("Firebaseに接続中…");
         await initFirebase();
-        if(settled) return;
         setupConnectionBanner();
-        setLoadingStep("各種データを読み込み中…" + attemptTag);
+
+        setLoadingStep("各種データを読み込み中…");
         // loadFiscalPresetsはloadFiscalSettingsの結果(移行処理)に依存するため、
-        // それ以外の読み込みと一緒に並列化して待ち時間を短縮する
-        await Promise.all([loadRoster(), loadSpecialDates(), loadAdminPassword(), loadRestorePasscode(), loadFiscalSettings(), loadPrefDeadline()]);
-        if(settled) return;
+        // それ以外の読み込みと一緒に並列化して待ち時間を短縮する。
+        // Safariで一部処理だけ長時間pendingになることがあるが、
+        // ここでは同じ初期化処理を二重起動せず、正常完了を待つ。
+        await Promise.all([
+          loadRoster(),
+          loadSpecialDates(),
+          loadAdminPassword(),
+          loadRestorePasscode(),
+          loadFiscalSettings(),
+          loadPrefDeadline()
+        ]);
+
         await loadFiscalPresets();
-        if(settled) return;
-        setLoadingStep("画面を準備中…" + attemptTag);
+
+        setLoadingStep("画面を準備中…");
         await loadTab(currentTab);
-        if(settled) return;
         render();
       }catch(e){
-        // 何が起きても読み込み中表示だけは残さないようにする
-        // （ウォッチドッグと違い、こちらは「エラーで即終了」のケースなので
-        //   毎回自動リトライはせず、従来通りトーストで知らせて表に進む）
         if(!settled){
           settled = true;
-          clearTimeout(watchdog);
-          console.error("起動処理でエラー:", e);
-          showToast("読み込み中にエラーが発生しました。再読み込みしてください");
-          const elapsed = ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) - overlayShownAt;
-          setTimeout(hideOverlayNow, Math.max(0, OVERLAY_MIN_MS - elapsed));
+          clearTimeout(longWaitTimer);
+          clearTimeout(reloadOptionTimer);
+          console.error("起動処理で実エラー:", e);
+          showLoadingErrorScreen(currentLoadingStepLabel);
+          if(errorDetailEl){
+            errorDetailEl.textContent =
+              `「${currentLoadingStepLabel}」でエラーが発生しました。\n` +
+              `${e && e.message ? e.message : String(e)}\n` +
+              `再読み込みをお試しください。`;
+          }
         }
         return;
       }
-      if(settled) return; // すでにウォッチドッグ側でエラー画面表示済み
+
+      if(settled) return;
       settled = true;
-      clearTimeout(watchdog);
+      clearTimeout(longWaitTimer);
+      clearTimeout(reloadOptionTimer);
+
+      // 45秒超表示が出ていた場合も、後から正常完了したら通常起動へ戻す。
+      if(errorBox) errorBox.style.display = "none";
+      if(spinnerEl) spinnerEl.style.display = "";
+      if(textEl) textEl.style.display = "";
+      if(stepEl) stepEl.style.display = "";
+
       const elapsed = ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) - overlayShownAt;
       const remaining = Math.max(0, OVERLAY_MIN_MS - elapsed);
       setTimeout(hideOverlayNow, remaining);
@@ -4824,7 +4853,7 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
   });
 
   renderSyncStatus();
-  attemptInit(1);
+  attemptInit();
 })();
 </script>
 </html>
