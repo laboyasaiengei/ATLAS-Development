@@ -1091,6 +1091,7 @@ function syncClassifyTag(tag){
   else if(lower.includes("preference") || lower.includes("pref")) area="希望表";
   else if(lower.includes("roster")) area="名簿";
   else if(lower.includes("score")) area="スコア";
+  else if(lower.includes("calendarscorerange")) area="スコア";
   else if(lower.includes("special")) area="特例日";
   else if(lower.includes("backup") || lower.includes("restore")) area="バックアップ";
   else if(lower.includes("admin") || lower.includes("passcode")) area="認証設定";
@@ -2479,14 +2480,22 @@ function render(){
     // 他タブに同じ場所名・同じ(編集前の)内容+担当者のタスクがあれば、連動編集の候補として確認する
     let matches=[];
     if(sec && task && firebaseReady){
-      for(const t of otherTabsOf(currentTab)){
+      const others = otherTabsOf(currentTab);
+      const results = await Promise.all(others.map(async t=>{
         try{
-          const snap = await withDbTimeout(structureRef(t).get(), "crossTabEdit-get-timeout");
-          const sections = (snap.exists && snap.data() && snap.data().sections) ? snap.data().sections : [];
+          let sections = structures[t];
+          if(!Array.isArray(sections)){
+            const snap = await withDbTimeout(structureRef(t).get(), "crossTabEdit-get-timeout");
+            sections = (snap.exists && snap.data() && snap.data().sections) ? snap.data().sections : [];
+            structures[t] = sections;
+          }
           const s2 = sections.find(s=>s.name===sec.name);
-          if(s2 && s2.tasks.some(tk=>isSameTask(tk, {text:originalText, assignee:originalAssignee}))) matches.push(t);
-        }catch(err){ /* 確認できなければ現在のタブのみ更新する */ }
-      }
+          return !!(s2 && s2.tasks.some(tk=>isSameTask(tk, {text:originalText, assignee:originalAssignee})));
+        }catch(err){
+          return false;
+        }
+      }));
+      matches = others.filter((t,i)=>results[i]);
     }
 
     if(matches.length===0){
@@ -2574,14 +2583,22 @@ function render(){
     // 他タブに同じ場所名・同じ内容+担当者のタスクがあれば、連動削除の候補として確認する
     let matches=[];
     if(sourceSec && task && firebaseReady){
-      for(const t of otherTabsOf(currentTab)){
+      const others = otherTabsOf(currentTab);
+      const results = await Promise.all(others.map(async t=>{
         try{
-          const snap = await withDbTimeout(structureRef(t).get(), "crossTabDelete-get-timeout");
-          const sections = (snap.exists && snap.data() && snap.data().sections) ? snap.data().sections : [];
+          let sections = structures[t];
+          if(!Array.isArray(sections)){
+            const snap = await withDbTimeout(structureRef(t).get(), "crossTabDelete-get-timeout");
+            sections = (snap.exists && snap.data() && snap.data().sections) ? snap.data().sections : [];
+            structures[t] = sections;
+          }
           const sec = sections.find(s=>s.name===sourceSec.name);
-          if(sec && sec.tasks.some(tk=>isSameTask(tk, task))) matches.push(t);
-        }catch(err){ /* 確認できなければ通常削除のみ行う */ }
-      }
+          return !!(sec && sec.tasks.some(tk=>isSameTask(tk, task)));
+        }catch(err){
+          return false;
+        }
+      }));
+      matches = others.filter((t,i)=>results[i]);
     }
 
     if(matches.length===0){
@@ -2919,7 +2936,14 @@ document.getElementById("undoBtn").addEventListener("click", ()=>{
   undo();
 });
 document.getElementById("backupBtn").addEventListener("click", ()=>createBackup(false));
-document.getElementById("restoreBtn").addEventListener("click", ()=>{
+let restorePasscodeLoaded = false;
+async function ensureRestorePasscodeLoaded(){
+  if(restorePasscodeLoaded) return;
+  await loadRestorePasscode();
+  restorePasscodeLoaded = true;
+}
+document.getElementById("restoreBtn").addEventListener("click", async ()=>{
+  await ensureRestorePasscodeLoaded();
   openRestorePasscodeModal(()=> openRestoreModal());
 });
 document.getElementById("dateRefBtn").addEventListener("click", ()=>{
@@ -3744,21 +3768,31 @@ async function loadCalendarRange(dateStrs){
     });
   }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
 }
-async function loadAllCalendarForScore(){
+async function loadCalendarForScorePeriod(period){
+  if(!period) return {};
   try{
-    const snap = await withDbTimeout(calendarCol().get(), "calendarAll-get-timeout");
-    const map={};
-    snap.forEach(doc=>{ map[doc.id] = Array.isArray(doc.data().people) ? doc.data().people : []; });
+    const startId = `${period.startYear}-${pad2(period.startMonth)}-01`;
+    const lastDay = new Date(period.endYear, period.endMonth, 0).getDate();
+    const endId = `${period.endYear}-${pad2(period.endMonth)}-${pad2(lastDay)}`;
+    const snap = await withDbTimeout(
+      calendarCol()
+        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
+        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
+        .get(),
+      "calendarScoreRange-get-timeout"
+    );
+    const map = {};
+    snap.forEach(doc=>{
+      map[doc.id] = Array.isArray(doc.data().people) ? doc.data().people : [];
+    });
     return map;
-  }catch(e){ return calendarAssign; }
-}
-async function loadAllCalendarForScore(){
-  try{
-    const snap = await calendarCol().get();
-    const map={};
-    snap.forEach(doc=>{ map[doc.id] = Array.isArray(doc.data().people) ? doc.data().people : []; });
+  }catch(e){
+    const map = {};
+    Object.keys(calendarAssign).forEach(ds=>{
+      if(dateInPeriod(ds, period)) map[ds] = calendarAssign[ds];
+    });
     return map;
-  }catch(e){ return calendarAssign; }
+  }
 }
 async function purgeDutyDataForPeriod(period){
   const collections = [preferencesCol(), calendarCol()];
@@ -3855,6 +3889,32 @@ function monthDates(year,month){ // month: 0-11
 
 /* ---- 当番管理: 全体の描画振り分け ---- */
 let dutySub = "pref";
+
+/* 当番管理専用データはアプリ起動時に待たない。
+   当番管理を初めて開いた時に一度だけまとめて取得する。 */
+let dutyBootstrapLoaded = false;
+let dutyBootstrapPromise = null;
+async function ensureDutyBootstrapLoaded(){
+  if(dutyBootstrapLoaded) return;
+  if(dutyBootstrapPromise) return dutyBootstrapPromise;
+  dutyBootstrapPromise = (async ()=>{
+    await Promise.all([
+      loadRoster(),
+      loadSpecialDates(),
+      loadAdminPassword(),
+      loadFiscalSettings(),
+      loadPrefDeadline()
+    ]);
+    await loadFiscalPresets();
+    dutyBootstrapLoaded = true;
+  })();
+  try{
+    await dutyBootstrapPromise;
+  }finally{
+    dutyBootstrapPromise = null;
+  }
+}
+
 async function renderDutyPanel(){
   const el = document.getElementById("dutyMain");
   const topActions = document.getElementById("dutyTopActions");
@@ -4024,11 +4084,11 @@ let fiscalPresets = []; // [{id, startYear, startMonth, endYear, endMonth}]
 let selectedPeriodId = null; // 表示中の期間(未選択なら保存済みの先頭を使う)
 async function renderScorePanel(el){
   el.innerHTML = `<div class="empty-note">読み込み中…</div>`;
-  const allCal = await loadAllCalendarForScore();
   const currentPeriodId = (selectedPeriodId && fiscalPresets.some(p=>p.id===selectedPeriodId))
     ? selectedPeriodId
     : (fiscalPresets[0] ? fiscalPresets[0].id : null);
   const currentPeriod = fiscalPresets.find(p=>p.id===currentPeriodId) || null;
+  const allCal = currentPeriod ? await loadCalendarForScorePeriod(currentPeriod) : {};
   const scores = {}, counts = {};
   roster.forEach(n=>{ scores[n]=0; counts[n]=0; });
   if(currentPeriod){
@@ -4359,10 +4419,10 @@ async function openCalendarDayModal(ds){
     document.getElementById("calendarDayModal").classList.add("show");
 
         // 選択中の集計期間内での、これまでの累計当番回数を人ごとに集計(割り振りの参考用)
-    const allCal = await loadAllCalendarForScore();
     const currentPeriod = (selectedPeriodId && fiscalPresets.some(p=>p.id===selectedPeriodId))
       ? fiscalPresets.find(p=>p.id===selectedPeriodId)
       : (fiscalPresets[0] || null);
+    const allCal = currentPeriod ? await loadCalendarForScorePeriod(currentPeriod) : {};
     const counts = {};
     roster.forEach(n=>{ counts[n]=0; });
     Object.keys(allCal).forEach(otherDs=>{
@@ -4418,7 +4478,14 @@ document.getElementById("modeSwitch").addEventListener("click", async (e)=>{
   document.getElementById("dutyModeHeader").style.display = isDuty ? "" : "none";
   document.getElementById("main").style.display = isDuty ? "none" : "";
   document.getElementById("dutyMain").style.display = isDuty ? "" : "none";
-  if(isDuty){ await renderDutyPanel(); }
+  if(isDuty){
+    const dutyMain = document.getElementById("dutyMain");
+    if(!dutyBootstrapLoaded && dutyMain){
+      dutyMain.innerHTML = `<div class="empty-note">当番管理データを読み込み中…</div>`;
+    }
+    await ensureDutyBootstrapLoaded();
+    await renderDutyPanel();
+  }
 });
 document.getElementById("dutySubNav").addEventListener("click", async (e)=>{
   const btn = e.target.closest("button[data-dsub]");
@@ -4779,23 +4846,10 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
         await initFirebase();
         setupConnectionBanner();
 
-        setLoadingStep("各種データを読み込み中…");
-        // loadFiscalPresetsはloadFiscalSettingsの結果(移行処理)に依存するため、
-        // それ以外の読み込みと一緒に並列化して待ち時間を短縮する。
-        // Safariで一部処理だけ長時間pendingになることがあるが、
-        // ここでは同じ初期化処理を二重起動せず、正常完了を待つ。
-        await Promise.all([
-          loadRoster(),
-          loadSpecialDates(),
-          loadAdminPassword(),
-          loadRestorePasscode(),
-          loadFiscalSettings(),
-          loadPrefDeadline()
-        ]);
-
-        await loadFiscalPresets();
-
-        setLoadingStep("画面を準備中…");
+        setLoadingStep("栽培管理データを読み込み中…");
+        // 起動時は栽培管理の表示に必要なものだけ待つ。
+        // 名簿・希望表設定・年度設定など当番管理専用データは、
+        // 当番管理を初めて開いた時に ensureDutyBootstrapLoaded() で取得する。
         await loadTab(currentTab);
         render();
       }catch(e){
