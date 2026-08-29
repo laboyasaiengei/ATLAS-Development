@@ -1388,6 +1388,30 @@ function withDbTimeout(promise, tag){
   });
 }
 
+/* 起動・タブ切替に必須の読込専用。
+   15秒超を「失敗」に変換せず、元のFirestore Promiseそのものを最後まで待つ。
+   6秒/15秒の遅延状態は診断へ記録するが、自動で同じget()を二重発行しない。 */
+function withDbTrackedWait(promise, tag){
+  const token = syncOpStart(tag);
+  token.slowTimer = setTimeout(()=>syncOpSlow(token), FS_OP_SLOW_MS);
+  const longTimer = setTimeout(()=>{
+    if(!token.settled) syncOpLongWait(token, Object.assign(new Error(tag||"long-wait"), {isTimeout:true}));
+  }, FS_OP_LONG_WAIT_MS);
+
+  return Promise.resolve(promise).then(
+    result=>{
+      clearTimeout(longTimer);
+      syncOpPromiseSettled(token, true, result, null);
+      return result;
+    },
+    err=>{
+      clearTimeout(longTimer);
+      syncOpPromiseSettled(token, false, null, err);
+      throw err;
+    }
+  );
+}
+
 /* ---------- DEV: 同期状態・通信診断 ---------- */
 const syncDiag = {
   seq:0,
@@ -2142,7 +2166,7 @@ async function ensureStructureLoaded(tab){
     return structures[tab];
   }
   try{
-    const snap = await withDbTimeoutRetry(()=>structureRef(tab).get(), "structure-get-timeout");
+    const snap = await withDbTrackedWait(structureRef(tab).get(), "structure-get-timeout");
     if(snap.exists && snap.data() && snap.data().sections){
       let loaded = snap.data().sections;
       if(isPlaceholderStructure(loaded)){
@@ -2169,8 +2193,8 @@ async function ensureStructureLoaded(tab){
     // 「保存はせず」表示だけ初期データにして、次に正常に読めた時に
     // 正しいデータへ復旧できるようにする。
     connErrFail("栽培管理データの取得", e);
-    if(structures[tab]) return structures[tab];
-    return withIds(INITIAL_DATA[tab].sections);
+    if(Array.isArray(structures[tab])) return structures[tab];
+    return null;
   }
 }
 
@@ -2382,7 +2406,7 @@ async function loadTodayChecks(tab){
     return;
   }
   try{
-    const snap = await withDbTimeoutRetry(()=>checksRef(tab, todayStr).get(), "todayChecks-get-timeout");
+    const snap = await withDbTrackedWait(checksRef(tab, todayStr).get(), "todayChecks-get-timeout");
     todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
     todayCheckedCache[tab] = todayChecked;
     emergencyTouch("checks", tab);
@@ -2544,13 +2568,14 @@ async function loadTab(tab){
   if(!hasStructureCache) essentialJobs.push(ensureStructureLoaded(tab));
   if(!hasChecksCache) essentialJobs.push(loadTodayChecks(tab));
   const essential = Promise.all(essentialJobs);
+  let tabEssentialsReady = hasStructureCache && hasChecksCache;
 
   pruneOldChecks(tab); // 結果を待つ必要のない裏方処理（削除のみ）
   loadDateStats(tab).then(()=>{
-    if(myGen===loadTabGeneration && currentTab===tab) render();
+    if(tabEssentialsReady && myGen===loadTabGeneration && currentTab===tab) render();
   });
   loadViewDateAssignees(viewDate).then(()=>{
-    if(myGen===loadTabGeneration && currentTab===tab) render();
+    if(tabEssentialsReady && myGen===loadTabGeneration && currentTab===tab) render();
   });
 
   let tabSlowTimer=null;
@@ -2562,13 +2587,27 @@ async function loadTab(tab){
       }
     },6000);
   }
-  await essential;
+  const essentialResults = await essential;
   if(tabSlowTimer) clearTimeout(tabSlowTimer);
-  // 待っている間に別のタブへ切り替えられていたら、この呼び出しの結果は
-  // 使わない（古いタブのデータで現在の表示や購読を上書きしないため）。
+
+  // 待っている間に別のタブへ切り替えられていたら、この呼び出しの結果は使わない。
   if(myGen !== loadTabGeneration || currentTab!==tab) return;
 
-  checkedMap = todayChecked;
+  // 栽培構成が実際に取得できなかった場合は、空画面を通常データとして描画しない。
+  // 「場所がありません」と誤認させず、明示的な再試行だけを提示する。
+  if(!Array.isArray(structures[tab])){
+    const main=document.getElementById("main");
+    if(main){
+      main.innerHTML=`<div class="empty-note">この管理タブのデータを取得できませんでした。<br><small>通信状態が回復してから再試行してください。</small><br><button id="retryTabLoadBtn" style="margin-top:10px;border:1px solid var(--line);border-radius:999px;padding:7px 12px;background:var(--paper);">再試行</button></div>`;
+      const retry=document.getElementById("retryTabLoadBtn");
+      if(retry) retry.addEventListener("click",()=>loadTab(tab));
+    }
+    return;
+  }
+
+  tabEssentialsReady = true;
+  checkedMap = todayCheckedCache[tab] || todayChecked || {};
+  todayChecked = checkedMap;
   subscribeStructure(tab);
   subscribeChecks(tab);
   updateUndoBtn();
@@ -2766,7 +2805,11 @@ function render(){
   if(sections.length===0){
     const note=document.createElement("div");
     note.className="empty-note";
-    note.textContent="まだ場所がありません。下の「＋ 新しい場所を追加」から作成してください";
+    if(!Array.isArray(structures[currentTab])){
+      note.textContent="この管理タブのデータはまだ読み込まれていません";
+    }else{
+      note.textContent="まだ場所がありません。下の「＋ 新しい場所を追加」から作成してください";
+    }
     main.appendChild(note);
   }
 
@@ -3741,18 +3784,33 @@ function addMonthsYM(year, month, delta){
 }
 function fiscalPresetsRef(){ return db.collection("duty_settings").doc("fiscalPresets"); }
 async function loadFiscalPresets(){
-  return shareInflight(dutyInflight.fiscal, "presets", async ()=>{
-  try{
-    const snap = await withDbTimeout(fiscalPresetsRef().get(), "fiscalPresets-get-timeout");
-    if(snap.exists && Array.isArray(snap.data().list) && snap.data().list.length){
-      fiscalPresets = snap.data().list;
-    }else{
-      const migrated = { id: genId("fp"), startYear: fiscalStartYear, startMonth: fiscalStartMonth, endYear: fiscalEndYear, endMonth: fiscalEndMonth };
-      fiscalPresets = [migrated];
-      await saveFiscalPresets();
+  if(fiscalPresetsLoaded) return;
+  if(fiscalPresetsPromise) return fiscalPresetsPromise;
+  fiscalPresetsPromise = (async ()=>{
+    try{
+      const snap = await shareTrackedReadInflight(
+        dutyInflight.fiscal,
+        "presets",
+        ()=>fiscalPresetsRef().get(),
+        "fiscalPresets-get-timeout"
+      );
+      if(snap.exists && Array.isArray(snap.data().list) && snap.data().list.length){
+        fiscalPresets = snap.data().list;
+      }else{
+        const migrated = { id: genId("fp"), startYear: fiscalStartYear, startMonth: fiscalStartMonth, endYear: fiscalEndYear, endMonth: fiscalEndMonth };
+        fiscalPresets = [migrated];
+        await saveFiscalPresets();
+      }
+      fiscalPresetsLoaded = true;
+      emergencyTouch("dutyMeta");
+      scheduleEmergencySnapshotSave();
+    }catch(e){
+      /* 失敗時は未読込のまま。スコア再表示時に再試行できる */
+    }finally{
+      fiscalPresetsPromise = null;
     }
-  }catch(e){ /* オフライン時は空のまま */ }
-  });
+  })();
+  return fiscalPresetsPromise;
 }
 async function saveFiscalPresets(){
   try{ await withDbTimeout(fiscalPresetsRef().set({ list: fiscalPresets }), "fiscalPresets-set-timeout"); }
@@ -4091,13 +4149,25 @@ function stableDateRangeKey(dateStrs){
 }
 async function shareInflight(map, key, factory){
   if(map.has(key)) return map.get(key);
-  const p = Promise.resolve().then(factory);
-  map.set(key, p);
-  try{
-    return await p;
-  }finally{
-    if(map.get(key)===p) map.delete(key);
-  }
+  const raw = Promise.resolve().then(factory);
+  map.set(key, raw);
+  raw.finally(()=>{
+    if(map.get(key)===raw) map.delete(key);
+  });
+  return raw;
+}
+
+/* Firestore読込用:
+   診断上の6秒/15秒は表示だけに使い、in-flight登録は元Promiseが本当にsettleするまで維持する。 */
+function shareTrackedReadInflight(map, key, rawPromiseFactory, tag){
+  if(map.has(key)) return map.get(key);
+  const raw = Promise.resolve().then(rawPromiseFactory);
+  const tracked = withDbTrackedWait(raw, tag);
+  map.set(key, tracked);
+  tracked.finally(()=>{
+    if(map.get(key)===tracked) map.delete(key);
+  });
+  return tracked;
 }
 function rangeCacheFresh(dateStrs, loadedAt){
   const now = Date.now();
@@ -4109,14 +4179,15 @@ async function loadPreferencesRange(dateStrs, force=false){
   if(dateStrs.length === 0) return;
   if(!force && rangeCacheFresh(dateStrs, preferencesLoadedAt)) return;
   const key = stableDateRangeKey(dateStrs);
-  return shareInflight(dutyInflight.preferences, key, async ()=>{
-    try{
+  try{
       const sorted = dateStrs.slice().sort();
       const startId = sorted[0];
       const endId = sorted[sorted.length-1];
       const wanted = new Set(dateStrs);
-      const snap = await withDbTimeout(
-        preferencesCol()
+      const snap = await shareTrackedReadInflight(
+        dutyInflight.preferences,
+        key,
+        ()=>preferencesCol()
           .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
           .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
           .get(),
@@ -4133,8 +4204,7 @@ async function loadPreferencesRange(dateStrs, force=false){
       dateStrs.forEach(ds=>{ preferencesLoadedAt[ds] = loadedNow; });
       emergencyTouch("preferences");
       scheduleEmergencySnapshotSave();
-    }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
-  });
+  }catch(e){ /* オフライン/エラー時は既存キャッシュのまま */ }
 }
 async function togglePreference(dateStr){
   if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
@@ -4234,14 +4304,15 @@ async function loadCalendarRange(dateStrs, force=false){
   if(dateStrs.length === 0) return;
   if(!force && rangeCacheFresh(dateStrs, calendarLoadedAt)) return;
   const key = stableDateRangeKey(dateStrs);
-  return shareInflight(dutyInflight.calendar, key, async ()=>{
-    try{
+  try{
       const sorted = dateStrs.slice().sort();
       const startId = sorted[0];
       const endId = sorted[sorted.length-1];
       const wanted = new Set(dateStrs);
-      const snap = await withDbTimeout(
-        calendarCol()
+      const snap = await shareTrackedReadInflight(
+        dutyInflight.calendar,
+        key,
+        ()=>calendarCol()
           .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
           .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
           .get(),
@@ -4259,8 +4330,7 @@ async function loadCalendarRange(dateStrs, force=false){
       dateStrs.forEach(ds=>{ calendarLoadedAt[ds] = loadedNow; });
       emergencyTouch("calendar");
       scheduleEmergencySnapshotSave();
-    }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
-  });
+  }catch(e){ /* オフライン/エラー時は既存キャッシュのまま */ }
 }
 const scorePeriodCache = {};
 async function loadCalendarForScorePeriod(period, force=false){
@@ -4273,13 +4343,14 @@ async function loadCalendarForScorePeriod(period, force=false){
   const cacheKey = period.id || `${period.startYear}-${period.startMonth}-${period.endYear}-${period.endMonth}`;
   const cached = scorePeriodCache[cacheKey];
   if(!force && cached && Date.now()-cached.at < DUTY_RANGE_CACHE_MS) return cached.map;
-  return shareInflight(dutyInflight.score, cacheKey, async ()=>{
-    try{
+  try{
     const startId = `${period.startYear}-${pad2(period.startMonth)}-01`;
     const lastDay = new Date(period.endYear, period.endMonth, 0).getDate();
     const endId = `${period.endYear}-${pad2(period.endMonth)}-${pad2(lastDay)}`;
-    const snap = await withDbTimeout(
-      calendarCol()
+    const snap = await shareTrackedReadInflight(
+      dutyInflight.score,
+      cacheKey,
+      ()=>calendarCol()
         .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
         .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
         .get(),
@@ -4298,7 +4369,6 @@ async function loadCalendarForScorePeriod(period, force=false){
       });
       return map;
     }
-  });
 }
 async function purgeDutyDataForPeriod(period){
   const collections = [preferencesCol(), calendarCol()];
@@ -4412,7 +4482,6 @@ async function ensureDutyBootstrapLoaded(){
       loadFiscalSettings(),
       loadPrefDeadline()
     ]);
-    await loadFiscalPresets();
     dutyBootstrapLoaded = true;
     emergencyTouch("dutyMeta");
     scheduleEmergencySnapshotSave();
@@ -4603,10 +4672,15 @@ async function renderPrefPanel(el, skipReload){
 }
 
 /* ---- スコアパネル ---- */
-let fiscalPresets = []; // [{id, startYear, startMonth, endYear, endMonth}]
+let fiscalPresets = [];
+let fiscalPresetsLoaded = false;
+let fiscalPresetsPromise = null; // [{id, startYear, startMonth, endYear, endMonth}]
 let selectedPeriodId = null; // 表示中の期間(未選択なら保存済みの先頭を使う)
 async function renderScorePanel(el){
   el.innerHTML = `<div class="empty-note">読み込み中…</div>`;
+  if(!fiscalPresetsLoaded){
+    await loadFiscalPresets();
+  }
   const currentPeriodId = (selectedPeriodId && fiscalPresets.some(p=>p.id===selectedPeriodId))
     ? selectedPeriodId
     : (fiscalPresets[0] ? fiscalPresets[0].id : null);
@@ -4814,7 +4888,6 @@ async function renderCalendarPanel(el){
   let allDates = [];
   months.forEach(m=>{ allDates = allDates.concat(monthDates(m.year, m.month).list); });
   await loadCalendarRange(allDates,true);
-  await loadPreferencesRange(allDates.filter(isDutyDate),true);
     let html = `<div class="duty-section-title"><span class="title-text">当番カレンダー</span>
     <span class="duty-actions">
       ${emergencyMode ? `` : `<button class="lock-btn" id="editorLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>`}
