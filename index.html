@@ -168,6 +168,14 @@
   }
   .conn-banner.show{display:flex;}
   .conn-dot{width:7px; height:7px; border-radius:50%; background:var(--alert); flex:0 0 auto;}
+  .emergency-launch{margin-top:6px;display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:10.5px;color:#e7f0e6;}
+  .emergency-launch button{border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.08);color:#fff;border-radius:999px;padding:5px 10px;font-size:10.5px;font-weight:700;cursor:pointer;}
+  .emergency-launch .emergency-age{opacity:.8;}
+  .emergency-banner{background:#fff3e0;color:#7a4b12;border:2px solid #e0b400;border-radius:12px;padding:11px 13px;margin-bottom:12px;font-size:12px;line-height:1.55;font-weight:700;}
+  .emergency-banner small{display:block;font-size:10.5px;font-weight:500;margin-top:3px;}
+  .emergency-info-box{background:#fff8e8;border:1px solid #e0b400;border-radius:12px;padding:12px 13px;font-size:12px;line-height:1.65;color:#6b5322;}
+  .emergency-info-box b{color:#5b4316;}
+  html[data-theme="dark"] .emergency-banner,html[data-theme="dark"] .emergency-info-box{background:#3a3314;color:#e8c98a;border-color:#8f7626;}
 
   .sync-status{
     display:flex; align-items:center; gap:6px; flex-wrap:wrap;
@@ -702,6 +710,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <div class="app-loading-error-title">読み込みに時間がかかっています</div>
     <div class="app-loading-error-detail" id="appLoadingErrorDetail"></div>
     <button type="button" class="app-loading-retry-btn" id="appLoadingRetryBtn">再読み込みする</button>
+    <button type="button" class="app-loading-retry-btn" id="appEmergencyBtn" style="display:none;background:#7a4b12;">非常用データを開く</button>
   </div>
 </div>
 
@@ -766,10 +775,24 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <span class="sync-label" id="syncStatusLabel">接続準備中</span>
     <span class="sync-detail" id="syncStatusDetail"></span>
   </div>
+  <div class="emergency-launch" id="emergencyLaunch">
+    <button type="button" id="emergencyOpenBtn">非常用モード</button>
+    <span class="emergency-age" id="emergencySnapshotAge">非常用データなし</span>
+  </div>
 </header>
 
 <main id="main"></main>
 <main id="dutyMain" style="display:none; padding:12px 16px 16px; max-width:640px; margin:0 auto;"></main>
+
+<div class="modal-overlay" id="emergencyModal">
+  <div class="modal-sheet">
+    <div class="modal-title">非常用オフラインモード</div>
+    <div class="modal-sub">サーバーへ接続できない場合に、端末へ保存済みのデータを読み取り専用で表示します</div>
+    <div class="emergency-info-box" id="emergencyInfoBox"></div>
+    <button class="modal-close" id="emergencyEnterBtn">非常用データを表示</button>
+    <button class="modal-close" id="emergencyCloseBtn">閉じる</button>
+  </div>
+</div>
 
 <div class="modal-overlay" id="restoreModal">
   <div class="modal-sheet">
@@ -970,6 +993,158 @@ function loadPdfLibs(){
     });
   }, 260);
 }
+
+/* =========================================================================
+   非常用オフラインモード（読み取り専用）
+   ========================================================================= */
+const EMERGENCY_SNAPSHOT_KEY = "atlasEmergencySnapshotV1";
+const EMERGENCY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const EMERGENCY_WARN_AGE_MS = 6 * 60 * 60 * 1000;
+let emergencyMode = false;
+let emergencySnapshot = null;
+let emergencySaveTimer = null;
+
+function emergencyClone(v){ try{return JSON.parse(JSON.stringify(v));}catch(e){return null;} }
+function emergencySnapshotRead(){
+  try{
+    const raw=localStorage.getItem(EMERGENCY_SNAPSHOT_KEY);
+    if(!raw) return null;
+    const data=JSON.parse(raw);
+    return data && data.savedAt ? data : null;
+  }catch(e){ return null; }
+}
+function emergencySnapshotStatus(snapshot=emergencySnapshotRead()){
+  if(!snapshot) return {usable:false,reason:"この端末には非常用データが保存されていません",age:null};
+  const savedAt=Number(snapshot.savedAt||0);
+  const age=Date.now()-savedAt;
+  if(!savedAt || age<0) return {usable:false,reason:"保存日時を確認できないため利用できません",age};
+  if(snapshot.day!==getTodayStr()) return {usable:false,reason:`保存データは${snapshot.day||"別日"}のものです。日付が違うため利用できません`,age};
+  if(age>EMERGENCY_MAX_AGE_MS) return {usable:false,reason:"保存から24時間を超えているため利用できません",age};
+  return {usable:true,reason:age>EMERGENCY_WARN_AGE_MS?"保存から6時間を超えています。内容が古い可能性があります":"利用可能",age};
+}
+function emergencyAgeLabel(age){
+  if(age===null || age===undefined || !isFinite(age)) return "—";
+  const mins=Math.max(0,Math.floor(age/60000));
+  if(mins<60) return `${mins}分前`;
+  const h=Math.floor(mins/60), m=mins%60;
+  return `${h}時間${m?m+"分":""}前`;
+}
+function emergencyFormatSavedAt(ms){
+  if(!ms) return "—";
+  return new Date(ms).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit",second:"2-digit"});
+}
+function updateEmergencyLauncher(){
+  emergencySnapshot=emergencySnapshotRead();
+  const ageEl=document.getElementById("emergencySnapshotAge");
+  if(!ageEl) return;
+  const st=emergencySnapshotStatus(emergencySnapshot);
+  ageEl.textContent=emergencySnapshot
+    ? `保存 ${emergencyFormatSavedAt(emergencySnapshot.savedAt)}（${emergencyAgeLabel(st.age)}）`
+    : "非常用データなし";
+}
+function buildEmergencySnapshot(){
+  return {
+    schema:1,savedAt:Date.now(),day:getTodayStr(),
+    structures:emergencyClone(structures||{}),
+    todayCheckedCache:emergencyClone(todayCheckedCache||{}),
+    calendarAssign:emergencyClone(calendarAssign||{}),
+    calendarChanged:emergencyClone(calendarChanged||{}),
+    calendarPrevious:emergencyClone(calendarPrevious||{}),
+    preferences:emergencyClone(preferences||{}),
+    priorities:emergencyClone(priorities||{}),
+    roster:emergencyClone(roster||[]),
+    specialDates:emergencyClone(specialDates||{}),
+    fiscalPresets:emergencyClone(fiscalPresets||[]),
+    selectedPeriodId:selectedPeriodId||null,
+    prefDeadline:emergencyClone(prefDeadline),
+    currentTab,
+    viewDateAssignees:emergencyClone(viewDateAssignees||[])
+  };
+}
+function saveEmergencySnapshotNow(){
+  if(emergencyMode || !firebaseReady || !navigator.onLine) return;
+  try{
+    const snap=buildEmergencySnapshot();
+    if(!snap.structures || !Array.isArray(snap.structures[currentTab])) return;
+    localStorage.setItem(EMERGENCY_SNAPSHOT_KEY,JSON.stringify(snap));
+    emergencySnapshot=snap;
+    updateEmergencyLauncher();
+  }catch(e){}
+}
+function scheduleEmergencySnapshotSave(delay=350){
+  if(emergencyMode) return;
+  clearTimeout(emergencySaveTimer);
+  emergencySaveTimer=setTimeout(saveEmergencySnapshotNow,delay);
+}
+function emergencyBannerHtml(){
+  if(!emergencyMode || !emergencySnapshot) return "";
+  const st=emergencySnapshotStatus(emergencySnapshot);
+  return `<div class="emergency-banner">非常用オフラインモード（読み取り専用）
+    <small>保存日時: ${escapeHtml(emergencyFormatSavedAt(emergencySnapshot.savedAt))} ・ ${escapeHtml(emergencyAgeLabel(st.age))}<br>
+    サーバーの最新状態とは異なる可能性があります。編集内容は保存できません。通常運用へ戻るには再読み込みしてください。</small></div>`;
+}
+function openEmergencyModal(){
+  emergencySnapshot=emergencySnapshotRead();
+  const st=emergencySnapshotStatus(emergencySnapshot);
+  const box=document.getElementById("emergencyInfoBox");
+  const enter=document.getElementById("emergencyEnterBtn");
+  if(box){
+    if(!emergencySnapshot){
+      box.innerHTML=`<b>利用できません</b><br>${escapeHtml(st.reason)}<br><br>非常用データは通常接続中にATLASが自動保存します。`;
+    }else{
+      const warn=st.age>EMERGENCY_WARN_AGE_MS?`<br><b>注意:</b> ${escapeHtml(st.reason)}`:"";
+      box.innerHTML=`<b>保存日時:</b> ${escapeHtml(emergencyFormatSavedAt(emergencySnapshot.savedAt))}<br>
+        <b>経過:</b> ${escapeHtml(emergencyAgeLabel(st.age))}<br>
+        <b>保存日:</b> ${escapeHtml(emergencySnapshot.day||"—")}<br>
+        <b>利用条件:</b> 保存日が今日・保存から24時間以内<br>
+        <b>できること:</b> 栽培管理・当番情報の確認<br>
+        <b>できないこと:</b> チェック、編集、希望入力、保存、復元などサーバーへの変更
+        ${warn}<br><br>${st.usable?"このデータは非常用表示に利用できます。":`<b>利用できません:</b> ${escapeHtml(st.reason)}`}`;
+    }
+  }
+  if(enter) enter.disabled=!st.usable;
+  document.getElementById("emergencyModal")?.classList.add("show");
+}
+function enterEmergencyMode(){
+  const snap=emergencySnapshotRead();
+  const st=emergencySnapshotStatus(snap);
+  if(!st.usable){ showToast(st.reason); return; }
+  emergencySnapshot=snap;
+  emergencyMode=true;
+  structures=snap.structures||{};
+  todayCheckedCache=snap.todayCheckedCache||{asa:null,hiru:null,yugata:null};
+  calendarAssign=snap.calendarAssign||{};
+  calendarChanged=snap.calendarChanged||{};
+  calendarPrevious=snap.calendarPrevious||{};
+  preferences=snap.preferences||{};
+  priorities=snap.priorities||{};
+  roster=Array.isArray(snap.roster)?snap.roster:[];
+  specialDates=snap.specialDates||{};
+  fiscalPresets=Array.isArray(snap.fiscalPresets)?snap.fiscalPresets:[];
+  selectedPeriodId=snap.selectedPeriodId||null;
+  prefDeadline=snap.prefDeadline||null;
+  currentTab=snap.currentTab && structures[snap.currentTab] ? snap.currentTab : "asa";
+  todayChecked=todayCheckedCache[currentTab]||{};
+  checkedMap=todayChecked;
+  viewDate=getTodayStr();
+  viewDateAssignees=snap.viewDateAssignees||calendarAssign[viewDate]||[];
+  editMode=false;
+  isAdmin=false;
+  dutyBootstrapLoaded=true;
+  unsubscribeAll();
+  document.getElementById("emergencyModal")?.classList.remove("show");
+  document.getElementById("appLoadingOverlay")?.classList.add("hide");
+  document.getElementById("checkModeHeader").style.display="";
+  document.getElementById("dutyModeHeader").style.display="none";
+  document.getElementById("main").style.display="";
+  document.getElementById("dutyMain").style.display="none";
+  document.querySelectorAll("#modeSwitch button").forEach(b=>b.classList.toggle("active",b.dataset.mode==="check"));
+  document.querySelectorAll("#tabNav button").forEach(b=>b.classList.toggle("active",b.dataset.tab===currentTab));
+  render();
+  renderSyncStatus();
+  showToast("非常用オフラインモードを開始しました");
+}
+
 /* =========================================================================
    Firebase 設定
    -------------------------------------------------------------------------
@@ -1266,6 +1441,12 @@ function renderSyncStatus(){
   const label=document.getElementById("syncStatusLabel");
   const detail=document.getElementById("syncStatusDetail");
   if(!wrap || !label || !detail) return;
+  if(emergencyMode){
+    wrap.className="sync-status state-offline";
+    label.textContent="非常用・読み取り専用";
+    detail.textContent=emergencySnapshot ? `保存 ${emergencyFormatSavedAt(emergencySnapshot.savedAt)}` : "";
+    return;
+  }
 
   const currentErrors=syncCurrentErrors();
   let state="ok", labelText="接続待機";
@@ -2202,10 +2383,12 @@ async function loadTab(tab){
   subscribeChecks(tab);
   updateUndoBtn();
   render();
+  scheduleEmergencySnapshotSave();
 }
 
 /* 日付チップを選択して表示日を切り替える */
 async function loadViewDateAssignees(day, force=false){
+  if(emergencyMode){ viewDateAssignees=calendarAssign[day]||[]; return; }
   if(!firebaseReady){ viewDateAssignees = []; return; }
   if(!force && calendarLoadedAt[day] && Date.now()-calendarLoadedAt[day] < DUTY_RANGE_CACHE_MS){
     viewDateAssignees = calendarAssign[day] || [];
@@ -2239,8 +2422,9 @@ function render(){
   if(isConfigPlaceholder()){
     showConfigBanner();
   }
+  if(emergencyMode) main.insertAdjacentHTML("beforeend", emergencyBannerHtml());
 
-  const readOnly = isHistoryMode();
+  const readOnly = isHistoryMode() || emergencyMode;
 
   if(readOnly){
     const { md, dow } = shortDowLabel(viewDate);
@@ -2262,7 +2446,8 @@ function render(){
   document.getElementById("undoBtn").style.display = readOnly ? "none" : "";
   document.getElementById("undoBtn").style.display = readOnly ? "none" : "";
   document.getElementById("backupBtn").style.display = readOnly ? "none" : "";
-  document.getElementById("backupBtn").style.display = readOnly ? "none" : "";
+  document.getElementById("restoreBtn").style.display = emergencyMode ? "none" : "";
+  document.getElementById("editModeBtn").style.display = emergencyMode ? "none" : "";
   document.getElementById("editModeBtn").classList.toggle("danger", editMode);
   document.getElementById("editModeBtn").textContent = editMode ? "✅ 完了" : "✏️ 編集";
 
@@ -3669,6 +3854,7 @@ function prefDeadlineDateObj(){
   return new Date(prefDeadline.date + "T" + (prefDeadline.time || "23:59") + ":00");
 }
 function isPrefOpen(){
+  if(emergencyMode) return false;
   const dl = prefDeadlineDateObj();
   return !dl || new Date() < dl; // 締切未設定なら常に受付中
 }
@@ -3690,6 +3876,7 @@ function rangeCacheFresh(dateStrs, loadedAt){
 }
 function preferencesCol(){ return db.collection("preferences"); }
 async function loadPreferencesRange(dateStrs, force=false){
+  if(emergencyMode) return;
   if(dateStrs.length === 0) return;
   if(!force && rangeCacheFresh(dateStrs, preferencesLoadedAt)) return;
   try{
@@ -3713,6 +3900,7 @@ async function loadPreferencesRange(dateStrs, force=false){
     });
     const loadedNow = Date.now();
     dateStrs.forEach(ds=>{ preferencesLoadedAt[ds] = loadedNow; });
+    scheduleEmergencySnapshotSave();
   }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
 }
 async function togglePreference(dateStr){
@@ -3807,6 +3995,7 @@ let calendarChanged = {};  // { "YYYY-MM-DD": true } 当番変更があった日
 let calendarPrevious = {}; // { "YYYY-MM-DD": ["name1",...] } 変更前の担当者
 function calendarCol(){ return db.collection("calendar"); }
 async function loadCalendarRange(dateStrs, force=false){
+  if(emergencyMode) return;
   if(dateStrs.length === 0) return;
   if(!force && rangeCacheFresh(dateStrs, calendarLoadedAt)) return;
   try{
@@ -3831,11 +4020,17 @@ async function loadCalendarRange(dateStrs, force=false){
     });
     const loadedNow = Date.now();
     dateStrs.forEach(ds=>{ calendarLoadedAt[ds] = loadedNow; });
+    scheduleEmergencySnapshotSave();
   }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
 }
 const scorePeriodCache = {};
 async function loadCalendarForScorePeriod(period, force=false){
   if(!period) return {};
+  if(emergencyMode){
+    const map={};
+    Object.keys(calendarAssign||{}).forEach(ds=>{ if(dateInPeriod(ds,period)) map[ds]=calendarAssign[ds]||[]; });
+    return map;
+  }
   const cacheKey = period.id || `${period.startYear}-${period.startMonth}-${period.endYear}-${period.endMonth}`;
   const cached = scorePeriodCache[cacheKey];
   if(!force && cached && Date.now()-cached.at < DUTY_RANGE_CACHE_MS) return cached.map;
@@ -3988,10 +4183,12 @@ async function ensureDutyBootstrapLoaded(){
 async function renderDutyPanel(){
   const el = document.getElementById("dutyMain");
   const topActions = document.getElementById("dutyTopActions");
-  if(topActions) topActions.style.display = isAdmin ? "" : "none";
-  if(dutySub==="pref") await renderPrefPanel(el);
+  if(topActions) topActions.style.display = (!emergencyMode && isAdmin) ? "" : "none";
+  if(dutySub==="pref") await renderPrefPanel(el, emergencyMode);
   else if(dutySub==="score") await renderScorePanel(el);
   else await renderCalendarPanel(el);
+  if(emergencyMode) el.insertAdjacentHTML("afterbegin", emergencyBannerHtml());
+  else scheduleEmergencySnapshotSave();
 }
 
 /* ---- 希望表パネル(今月・来月を分けて表示) ---- */
@@ -4895,6 +5092,8 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
       console.warn(`起動処理が15秒を超えて継続中: 「${currentLoadingStepLabel}」`);
       if(textEl) textEl.textContent = "サーバー応答を待っています…";
       if(stepEl) stepEl.textContent = `${currentLoadingStepLabel}（15秒超・処理継続中）`;
+      const emBtn=document.getElementById("appEmergencyBtn");
+      if(emBtn && emergencySnapshotStatus().usable) emBtn.style.display="";
     }, OVERLAY_LONG_WAIT_MS);
 
     // 45秒を超えた場合だけ、ユーザーに再読み込みという選択肢を提示する。
@@ -4955,6 +5154,16 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
       setTimeout(hideOverlayNow, remaining);
     })();
   }
+
+  updateEmergencyLauncher();
+  const emergencyOpenBtn=document.getElementById("emergencyOpenBtn");
+  if(emergencyOpenBtn) emergencyOpenBtn.addEventListener("click",openEmergencyModal);
+  const emergencyCloseBtn=document.getElementById("emergencyCloseBtn");
+  if(emergencyCloseBtn) emergencyCloseBtn.addEventListener("click",()=>document.getElementById("emergencyModal").classList.remove("show"));
+  const emergencyEnterBtn=document.getElementById("emergencyEnterBtn");
+  if(emergencyEnterBtn) emergencyEnterBtn.addEventListener("click",enterEmergencyMode);
+  const appEmergencyBtn=document.getElementById("appEmergencyBtn");
+  if(appEmergencyBtn) appEmergencyBtn.addEventListener("click",enterEmergencyMode);
 
   // DEV診断画面
   const devDiagBtn=document.getElementById("devDiagBtn");
