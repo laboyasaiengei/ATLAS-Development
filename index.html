@@ -1981,9 +1981,16 @@ function showConfigWarningOnce(){
 }
 
 /* ---------- 直近7日間の記録の統計取得・古い記録の整理 ---------- */
-async function loadDateStats(tab){
-  dateStats = {};
+const dateStatsCache = {};
+const dateStatsLoadedAt = {};
+const DATE_STATS_CACHE_MS = 45 * 1000;
+async function loadDateStats(tab, force=false){
   if(!firebaseReady) return;
+  if(!force && dateStatsCache[tab] && Date.now()-(dateStatsLoadedAt[tab]||0) < DATE_STATS_CACHE_MS){
+    dateStats = dateStatsCache[tab];
+    return;
+  }
+  const nextStats = {};
   const days = getLastNDays(HISTORY_DAYS);
   const oldest = days[days.length-1];
   try{
@@ -1994,21 +2001,37 @@ async function loadDateStats(tab){
     q.docs.forEach(doc=>{
       const day = doc.id.slice(tab.length+1);
       const data = doc.data();
-      dateStats[day] = data.stats || countStats(tab, data.data || {});
+      nextStats[day] = data.stats || countStats(tab, data.data || {});
     });
-  }catch(e){ /* 履歴統計の取得失敗は致命的でないため無視 */ }
+    dateStatsCache[tab] = nextStats;
+    dateStatsLoadedAt[tab] = Date.now();
+    if(currentTab===tab) dateStats = nextStats;
+  }catch(e){ /* 履歴統計の取得失敗は既存キャッシュを維持 */ }
 }
+const oldChecksPruneRunning = {};
+const oldChecksLastPrunedAt = {};
+const OLD_CHECKS_PRUNE_MIN_INTERVAL_MS = 30 * 60 * 1000;
 async function pruneOldChecks(tab){
   if(!firebaseReady) return;
+  if(oldChecksPruneRunning[tab]) return;
+  if(Date.now() - (oldChecksLastPrunedAt[tab] || 0) < OLD_CHECKS_PRUNE_MIN_INTERVAL_MS) return;
+  oldChecksPruneRunning[tab] = true;
   const days = getLastNDays(HISTORY_DAYS);
   const oldestKept = days[days.length-1];
   try{
+    // 通常は古い記録が少数なので、毎回全件走査せず小さなバッチだけ整理する。
     const q = await withDbTimeout(db.collection("checks")
       .where(firebase.firestore.FieldPath.documentId(), ">=", tab+"_")
       .where(firebase.firestore.FieldPath.documentId(), "<", tab+"_"+oldestKept)
+      .limit(25)
       .get(), "pruneChecks-get-timeout");
-    for(const d of q.docs){ await withDbTimeout(d.ref.delete(), "pruneChecks-delete-timeout"); }
-  }catch(e){ /* 整理失敗は無視 */ }
+    await Promise.all(q.docs.map(d=>withDbTimeout(d.ref.delete(), "pruneChecks-delete-timeout")));
+    oldChecksLastPrunedAt[tab] = Date.now();
+  }catch(e){
+    /* 整理失敗は通常操作を妨げない */
+  }finally{
+    oldChecksPruneRunning[tab] = false;
+  }
 }
 
 /* ---------- チェックの読み込み ---------- */
@@ -2182,12 +2205,18 @@ async function loadTab(tab){
 }
 
 /* 日付チップを選択して表示日を切り替える */
-async function loadViewDateAssignees(day){
+async function loadViewDateAssignees(day, force=false){
   if(!firebaseReady){ viewDateAssignees = []; return; }
+  if(!force && calendarLoadedAt[day] && Date.now()-calendarLoadedAt[day] < DUTY_RANGE_CACHE_MS){
+    viewDateAssignees = calendarAssign[day] || [];
+    return;
+  }
   try{
     const snap = await withDbTimeout(calendarCol().doc(day).get(), "viewDateAssignees-get-timeout");
     viewDateAssignees = (snap.exists && Array.isArray(snap.data().people)) ? snap.data().people : [];
-  }catch(e){ viewDateAssignees = []; }
+    calendarAssign[day] = viewDateAssignees.slice();
+    calendarLoadedAt[day] = Date.now();
+  }catch(e){ viewDateAssignees = calendarAssign[day] || []; }
 }
 
 async function selectDate(day){
@@ -2746,20 +2775,41 @@ async function createBackup(silent){
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     }), "backup-add-timeout");
     if(!silent) showToast("保存しました");
-    await pruneBackups();
+    // 世代整理は保存本体ではないため、操作完了を待たせない。
+    // 同じタブで整理が重複しないよう pruneBackups() 側でガードする。
+    pruneBackups(currentTab);
   }catch(e){
     if(!silent) connErrFail("バックアップの保存", e);
   }
 }
-async function pruneBackups(){
+const backupPruneRunning = {};
+const backupLastPrunedAt = {};
+const BACKUP_PRUNE_MIN_INTERVAL_MS = 5 * 60 * 1000;
+async function pruneBackups(tab=currentTab, force=false){
+  if(!firebaseReady) return;
+  if(backupPruneRunning[tab]) return;
+  if(!force && Date.now() - (backupLastPrunedAt[tab] || 0) < BACKUP_PRUNE_MIN_INTERVAL_MS) return;
+  backupPruneRunning[tab] = true;
   try{
-    const q = await withDbTimeout(backupsCol(currentTab).orderBy("createdAt","desc").get(), "pruneBackups-get-timeout");
+    // 100件を超えた分だけ分かればよいので、全バックアップを毎回取得しない。
+    const q = await withDbTimeout(
+      backupsCol(tab).orderBy("createdAt","desc").limit(BACKUP_LIMIT + 20).get(),
+      "pruneBackups-get-timeout"
+    );
     const docs = q.docs;
     if(docs.length>BACKUP_LIMIT){
       const excess = docs.slice(BACKUP_LIMIT);
-      for(const d of excess){ await withDbTimeout(backupsCol(currentTab).doc(d.id).delete(), "pruneBackups-delete-timeout"); }
+      // 削除は裏方処理。順番待ちを避けるため並列実行する。
+      await Promise.all(excess.map(d=>
+        withDbTimeout(backupsCol(tab).doc(d.id).delete(), "pruneBackups-delete-timeout")
+      ));
     }
-  }catch(e){ /* 一覧整理の失敗は致命的ではないため無視 */ }
+    backupLastPrunedAt[tab] = Date.now();
+  }catch(e){
+    /* 一覧整理の失敗は保存本体を失敗扱いにしない */
+  }finally{
+    backupPruneRunning[tab] = false;
+  }
 }
 
 /* ---------- 自動バックアップ(変更のたびに少し間をおいて保存) ---------- */
@@ -3631,9 +3681,17 @@ function prefDeadlineLabel(){
 /* ---- 希望表 ---- */
 let preferences = {}; // { "YYYY-MM-DD": {name:true,...} } 当番
 let priorities = {};  // { "YYYY-MM-DD": {name:true,...} } 特に希望している人(当番のみ設定できる)
+const preferencesLoadedAt = {};
+const calendarLoadedAt = {};
+const DUTY_RANGE_CACHE_MS = 45 * 1000;
+function rangeCacheFresh(dateStrs, loadedAt){
+  const now = Date.now();
+  return dateStrs.length>0 && dateStrs.every(ds=>loadedAt[ds] && (now-loadedAt[ds] < DUTY_RANGE_CACHE_MS));
+}
 function preferencesCol(){ return db.collection("preferences"); }
-async function loadPreferencesRange(dateStrs){
+async function loadPreferencesRange(dateStrs, force=false){
   if(dateStrs.length === 0) return;
+  if(!force && rangeCacheFresh(dateStrs, preferencesLoadedAt)) return;
   try{
     const sorted = dateStrs.slice().sort();
     const startId = sorted[0];
@@ -3653,6 +3711,8 @@ async function loadPreferencesRange(dateStrs){
       preferences[doc.id] = data.wants || {};
       priorities[doc.id] = data.priority || {};
     });
+    const loadedNow = Date.now();
+    dateStrs.forEach(ds=>{ preferencesLoadedAt[ds] = loadedNow; });
   }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
 }
 async function togglePreference(dateStr){
@@ -3666,10 +3726,12 @@ async function togglePreference(dateStr){
   const optimisticWants = Object.assign({}, beforeWants);
   if(wasMine) delete optimisticWants[myName]; else optimisticWants[myName] = true;
   preferences[dateStr] = optimisticWants;
+  preferencesLoadedAt[dateStr] = Date.now();
 
   const optimisticPriority = Object.assign({}, beforePriority);
   if(wasMine) delete optimisticPriority[myName];
   priorities[dateStr] = optimisticPriority;
+  preferencesLoadedAt[dateStr] = Date.now();
   renderPrefPanel(document.getElementById("dutyMain"), true);
 
   try{
@@ -3744,8 +3806,9 @@ let calendarAssign = {}; // { "YYYY-MM-DD": ["name1","name2"] }
 let calendarChanged = {};  // { "YYYY-MM-DD": true } 当番変更があった日のフラグ
 let calendarPrevious = {}; // { "YYYY-MM-DD": ["name1",...] } 変更前の担当者
 function calendarCol(){ return db.collection("calendar"); }
-async function loadCalendarRange(dateStrs){
+async function loadCalendarRange(dateStrs, force=false){
   if(dateStrs.length === 0) return;
+  if(!force && rangeCacheFresh(dateStrs, calendarLoadedAt)) return;
   try{
     const sorted = dateStrs.slice().sort();
     const startId = sorted[0];
@@ -3766,10 +3829,16 @@ async function loadCalendarRange(dateStrs){
       calendarChanged[doc.id] = !!data.changed;
       calendarPrevious[doc.id] = Array.isArray(data.previousPeople) ? data.previousPeople : [];
     });
+    const loadedNow = Date.now();
+    dateStrs.forEach(ds=>{ calendarLoadedAt[ds] = loadedNow; });
   }catch(e){ /* オフライン/タイムアウト時は既存キャッシュのまま */ }
 }
-async function loadCalendarForScorePeriod(period){
+const scorePeriodCache = {};
+async function loadCalendarForScorePeriod(period, force=false){
   if(!period) return {};
+  const cacheKey = period.id || `${period.startYear}-${period.startMonth}-${period.endYear}-${period.endMonth}`;
+  const cached = scorePeriodCache[cacheKey];
+  if(!force && cached && Date.now()-cached.at < DUTY_RANGE_CACHE_MS) return cached.map;
   try{
     const startId = `${period.startYear}-${pad2(period.startMonth)}-01`;
     const lastDay = new Date(period.endYear, period.endMonth, 0).getDate();
@@ -3785,6 +3854,7 @@ async function loadCalendarForScorePeriod(period){
     snap.forEach(doc=>{
       map[doc.id] = Array.isArray(doc.data().people) ? doc.data().people : [];
     });
+    scorePeriodCache[cacheKey] = { at: Date.now(), map };
     return map;
   }catch(e){
     const map = {};
