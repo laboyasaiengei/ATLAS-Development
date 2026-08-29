@@ -1170,13 +1170,13 @@ function emergencyStatusLine(label, stat, at){
 }
 function emergencyBannerHtml(){
   if(!emergencyMode || !emergencySnapshot) return "";
-  const st=emergencySnapshotStatus(emergencySnapshot);
   const d=emergencySnapshot.domains||{};
   const calAt=d.calendar&&d.calendar.at;
   return `<div class="emergency-banner">非常用オフラインモード（読み取り専用）
     <small>サーバーの最新状態とは異なる可能性があります。表示される各領域の保存日時を必ず確認してください。<br>
-    ${calAt?`当番カレンダー: ${escapeHtml(emergencyFormatSavedAt(calAt))}`:"当番カレンダー: 利用可能な保存データなし"}<br>
-    通常運用へ戻るには再読み込みしてください。</small></div>`;
+    ${calAt?`当番カレンダー: ${escapeHtml(emergencyFormatSavedAt(calAt))}`:"当番カレンダー: 利用可能な保存データなし"}</small>
+    <button type="button" id="emergencyExitInlineBtn" style="margin-top:8px;border:1px solid #b58517;background:transparent;color:inherit;border-radius:999px;padding:6px 10px;font-size:11px;font-weight:700;">通常モードへ戻る</button>
+  </div>`;
 }
 function openEmergencyModal(){
   emergencySnapshot=emergencySnapshotRead();
@@ -1219,6 +1219,11 @@ function emergencyStopPendingLocalWork(){
     Object.keys(autoBackupTimers||{}).forEach(k=>clearTimeout(autoBackupTimers[k]));
   }catch(e){}
   try{ clearTimeout(dutyAutoBackupState.timer); }catch(e){}
+}
+function exitEmergencyMode(){
+  if(!emergencyMode) return;
+  if(!confirm("通常モードへ戻ります。サーバーへ再接続するため画面を再読み込みします。よろしいですか？")) return;
+  window.location.reload();
 }
 function enterEmergencyMode(){
   const snap=emergencySnapshotRead();
@@ -2523,12 +2528,15 @@ async function loadTab(tab){
   // タブ別キャッシュがある場合は、Firestoreを待たずにその場で切り替える。
   // 特にiOS/iPadOS 18系では IndexedDB/Firestore のPromise解決が一瞬遅れることが
   // あるため、「表示切替」と「最新化」を分離してタップの反応を優先する。
-  const hasStructureCache = !!structures[tab];
+  const hasStructureCache = Array.isArray(structures[tab]);
   const hasChecksCache = todayCheckedCache[tab] !== null;
   if(hasChecksCache) todayChecked = todayCheckedCache[tab] || {};
-  if(hasStructureCache && myGen===loadTabGeneration && currentTab===tab){
+  if(hasStructureCache && hasChecksCache && myGen===loadTabGeneration && currentTab===tab){
     checkedMap = todayChecked;
     render();
+  }else if(myGen===loadTabGeneration && currentTab===tab){
+    const main=document.getElementById("main");
+    if(main) main.innerHTML=`<div class="empty-note">この管理タブを読み込み中…</div>`;
   }
 
   // 初回だけget()を待つ。再訪時は既存キャッシュを使い、onSnapshotで最新化する。
@@ -2545,7 +2553,17 @@ async function loadTab(tab){
     if(myGen===loadTabGeneration && currentTab===tab) render();
   });
 
+  let tabSlowTimer=null;
+  if(essentialJobs.length){
+    tabSlowTimer=setTimeout(()=>{
+      if(myGen===loadTabGeneration && currentTab===tab){
+        const main=document.getElementById("main");
+        if(main) main.innerHTML=`<div class="empty-note">サーバー応答を待っています…<br><small>処理は継続中です</small></div>`;
+      }
+    },6000);
+  }
   await essential;
+  if(tabSlowTimer) clearTimeout(tabSlowTimer);
   // 待っている間に別のタブへ切り替えられていたら、この呼び出しの結果は
   // 使わない（古いタブのデータで現在の表示や購読を上書きしないため）。
   if(myGen !== loadTabGeneration || currentTab!==tab) return;
@@ -2588,13 +2606,20 @@ async function selectDate(day){
 }
 
 /* ---------- render ---------- */
+function bindEmergencyExitButton(){
+  const btn=document.getElementById("emergencyExitInlineBtn");
+  if(btn) btn.addEventListener("click",exitEmergencyMode);
+}
 function render(){
   const main = document.getElementById("main");
   main.innerHTML = "";
   if(isConfigPlaceholder()){
     showConfigBanner();
   }
-  if(emergencyMode) main.insertAdjacentHTML("beforeend", emergencyBannerHtml());
+  if(emergencyMode){
+    main.insertAdjacentHTML("beforeend", emergencyBannerHtml());
+    setTimeout(bindEmergencyExitButton,0);
+  }
 
   const readOnly = isHistoryMode() || emergencyMode;
 
@@ -4411,6 +4436,7 @@ async function renderDutyPanel(){
     }
     await renderCalendarPanel(el);
     el.insertAdjacentHTML("afterbegin", emergencyBannerHtml());
+    setTimeout(bindEmergencyExitButton,0);
     return;
   }
   if(dutySub==="pref") await renderPrefPanel(el);
@@ -4787,8 +4813,8 @@ async function renderCalendarPanel(el){
   ];
   let allDates = [];
   months.forEach(m=>{ allDates = allDates.concat(monthDates(m.year, m.month).list); });
-  await loadCalendarRange(allDates);
-  await loadPreferencesRange(allDates.filter(isDutyDate));
+  await loadCalendarRange(allDates,true);
+  await loadPreferencesRange(allDates.filter(isDutyDate),true);
     let html = `<div class="duty-section-title"><span class="title-text">当番カレンダー</span>
     <span class="duty-actions">
       ${emergencyMode ? `` : `<button class="lock-btn" id="editorLockBtn">${isAdmin?"🔓 管理者モード解除":"🔒 管理者パスワード入力"}</button>`}
@@ -4841,6 +4867,7 @@ async function renderCalendarPanel(el){
   el.querySelectorAll("[data-cal-date]").forEach(cell=>{
     cell.addEventListener("click", ()=>openCalendarDayModal(cell.getAttribute("data-cal-date")));
   });
+
 }
   async function openMonthDataModal(){
   const typeVal = prompt(
