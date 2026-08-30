@@ -1754,7 +1754,7 @@ function syncDiagText(){
   rows.push("長時間応答待ち(15秒超・読込): "+syncDiag.longWaitReads);
   rows.push("長時間応答待ち(15秒超・保存): "+syncDiag.longWaitWrites);
   rows.push("現在エラー: "+(currentErrors.length?currentErrors.map(n=>n+"="+syncDiag.areas[n].currentError).join(" / "):"—"));
-  rows.push("未同期保護データ: "+pendingSyncVisibleItems().length+"件");
+  rows.push("未同期保護データ: "+pendingSyncRead().length+"件");
   rows.push("最終サーバー確認: "+syncFmtTime(syncDiag.lastServerConfirmAt,true));
   rows.push("最終読込成功: "+syncFmtTime(syncDiag.lastReadSuccessAt,true));
   rows.push("最終保存成功: "+syncFmtTime(syncDiag.lastWriteSuccessAt,true));
@@ -2397,107 +2397,6 @@ function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   }
 }
 
-/* ---------- 栽培チェック: UI即時反映 + 背景保存 ---------- */
-const optimisticCheckGeneration={asa:0,hiru:0,yugata:0};
-const optimisticCheckWriteChains={};
-
-function optimisticChecksTarget(tab,day){
-  return tab+"_"+day;
-}
-function pendingCheckEntry(tab,day){
-  const target=optimisticChecksTarget(tab,day);
-  return pendingSyncRead().find(x=>x.kind==="checks" && x.target===target) || null;
-}
-function pendingCheckPatch(tab,day){
-  const item=pendingCheckEntry(tab,day);
-  return item && item.payload && item.payload.patch ? item.payload.patch : {};
-}
-function protectOptimisticChecks(tab,day,patch,generation){
-  const target=optimisticChecksTarget(tab,day);
-  const existing=pendingCheckEntry(tab,day);
-  const mergedPatch=Object.assign(
-    {},
-    existing && existing.payload && existing.payload.patch ? existing.payload.patch : {},
-    patch||{}
-  );
-  const data=JSON.parse(JSON.stringify(todayChecked||{}));
-  addPendingSync("checks",target,{
-    tab,day,
-    data,
-    stats:countStats(tab,data),
-    patch:mergedPatch
-  },{
-    state:"sending",
-    silent:true,
-    generation
-  });
-}
-function overlayPendingCheckPatch(tab,day,serverData){
-  const next=JSON.parse(JSON.stringify(serverData||{}));
-  const patch=pendingCheckPatch(tab,day);
-  Object.keys(patch).forEach(tId=>{ next[tId]=!!patch[tId]; });
-  return next;
-}
-function queueOptimisticCheckSave(tab,day,patch,generation){
-  const target=optimisticChecksTarget(tab,day);
-  const previous=optimisticCheckWriteChains[target] || Promise.resolve();
-
-  const job=previous.catch(()=>{}).then(async ()=>{
-    let longTimer=setTimeout(()=>{
-      markPendingSyncFailed("checks",target,generation);
-    },FS_OP_LONG_WAIT_MS);
-
-    try{
-      await withDbTrackedWait(db.runTransaction(async tx=>{
-        const ref=checksRef(tab,day);
-        const snap=await tx.get(ref);
-        const current=(snap.exists&&snap.data()&&snap.data().data)?snap.data().data:{};
-        const next=JSON.parse(JSON.stringify(current));
-        Object.keys(patch||{}).forEach(tId=>{ next[tId]=!!patch[tId]; });
-        const stats=countStats(tab,next);
-        tx.set(ref,{
-          data:next,
-          stats,
-          updatedAt:firebase.firestore.FieldValue.serverTimestamp()
-        });
-      }),"todayChecks-optimistic-transaction");
-      clearTimeout(longTimer);
-      removePendingSyncTarget("checks",target,generation);
-      scheduleAutoBackup(tab);
-    }catch(e){
-      clearTimeout(longTimer);
-      markPendingSyncFailed("checks",target,generation);
-      syncMarkSnapshotError("栽培チェック",e);
-    }
-  });
-
-  optimisticCheckWriteChains[target]=job.finally(()=>{
-    if(optimisticCheckWriteChains[target]===job) delete optimisticCheckWriteChains[target];
-  });
-}
-function applyOptimisticCheckPatch(tab,patch){
-  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
-  if(!firebaseReady){ showConfigWarningOnce(); return; }
-
-  const day=todayStr;
-  const generation=(optimisticCheckGeneration[tab]||0)+1;
-  optimisticCheckGeneration[tab]=generation;
-
-  const next=JSON.parse(JSON.stringify(todayChecked||{}));
-  Object.keys(patch||{}).forEach(tId=>{ next[tId]=!!patch[tId]; });
-
-  todayChecked=next;
-  todayCheckedCache[tab]=next;
-  dateStats[day]=countStats(tab,next);
-  if(tab===currentTab && !isHistoryMode()){
-    checkedMap=next;
-    render();
-  }
-
-  protectOptimisticChecks(tab,day,patch,generation);
-  queueOptimisticCheckSave(tab,day,patch,generation);
-}
-
 /* ---------- 記録シート記入と連動したタスクの自動チェック ---------- */
 async function autoCheckLinkedTask(tab, sectionName, matchFn){
   try{
@@ -2631,12 +2530,11 @@ function subscribeChecks(tab){
   unsubChecks = checksRef(tab, todayStr).onSnapshot((snap)=>{
     syncMarkSnapshot("栽培チェック", snap);
     if(snap.metadata.hasPendingWrites) return;
-    const serverChecks=(snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
-    todayChecked = overlayPendingCheckPatch(tab,todayStr,serverChecks);
+    todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
     todayCheckedCache[tab] = todayChecked;
     if(!snap.metadata.fromCache) emergencyTouch("checks", tab);
-    dateStats[todayStr] = countStats(tab,todayChecked);
-    if(tab===currentTab && !isHistoryMode()){
+    dateStats[todayStr] = (snap.exists && snap.data() && snap.data().stats) ? snap.data().stats : countStats(tab, todayChecked);
+        if(tab===currentTab && !isHistoryMode()){
       checkedMap = todayChecked;
       render();
     }
@@ -2716,72 +2614,26 @@ function pendingSyncDetail(item){
   }
   return item.target||"";
 }
-function addPendingSync(kind,target,payload,opts){
-  const o=opts||{};
+function addPendingSync(kind,target,payload){
   const items=pendingSyncRead();
   const now=Date.now();
-  const existing=items.find(x=>x.kind===kind && x.target===target);
   const item={
-    id:existing ? existing.id : "ps_"+now.toString(36)+Math.random().toString(36).slice(2,6),
-    kind,target,payload,
-    createdAt:existing && existing.createdAt ? existing.createdAt : now,
-    failedAt:o.state==="sending" ? null : now,
-    state:o.state || "pending",
-    generation:Number(o.generation||0)
+    id:"ps_"+now.toString(36)+Math.random().toString(36).slice(2,6),
+    kind,target,payload,failedAt:now
   };
   const next=items.filter(x=>!(x.kind===kind && x.target===target));
   next.push(item);
   pendingSyncWrite(next);
-  if(!o.silent) showToast("保存できなかった変更を未同期データとして保護しました");
+  showToast("保存できなかった変更を未同期データとして保護しました");
   return item;
 }
 function removePendingSync(id){
   pendingSyncWrite(pendingSyncRead().filter(x=>x.id!==id));
 }
-function removePendingSyncTarget(kind,target,generation){
-  const items=pendingSyncRead();
-  const next=items.filter(x=>{
-    if(x.kind!==kind || x.target!==target) return true;
-    if(generation && Number(x.generation||0)!==Number(generation)) return true;
-    return false;
-  });
-  pendingSyncWrite(next);
-}
-function markPendingSyncFailed(kind,target,generation){
-  const items=pendingSyncRead();
-  let changed=false;
-  items.forEach(x=>{
-    if(x.kind===kind && x.target===target &&
-       (!generation || Number(x.generation||0)===Number(generation))){
-      x.state="pending";
-      x.failedAt=Date.now();
-      changed=true;
-    }
-  });
-  if(changed){
-    pendingSyncWrite(items);
-    showToast("保存確認に時間がかかっているため、変更を未同期データとして保護しています");
-  }
-}
-function recoverPendingSyncDrafts(){
-  const items=pendingSyncRead();
-  let changed=false;
-  items.forEach(x=>{
-    if(x.state==="sending"){
-      x.state="pending";
-      x.failedAt=x.failedAt || x.createdAt || Date.now();
-      changed=true;
-    }
-  });
-  if(changed) pendingSyncWrite(items);
-}
-function pendingSyncVisibleItems(){
-  return pendingSyncRead().filter(x=>x.state!=="sending");
-}
 function renderPendingSyncBadge(){
   const badge=document.getElementById("pendingSyncBadge");
   if(!badge) return;
-  const n=pendingSyncVisibleItems().length;
+  const n=pendingSyncRead().length;
   badge.classList.toggle("show",n>0);
   badge.textContent=n>0?`未同期あり ${n}`:"未同期あり";
 }
@@ -2793,7 +2645,7 @@ function pendingSyncFmtTime(ms){
 function renderPendingSyncModal(){
   const list=document.getElementById("pendingSyncList");
   if(!list) return;
-  const items=pendingSyncVisibleItems();
+  const items=pendingSyncRead();
   if(!items.length){
     list.innerHTML=`<div class="empty-note">未同期データはありません</div>`;
     return;
@@ -2863,36 +2715,15 @@ async function retryPendingSync(item){
     }
     if(item.kind==="checks"){
       if(!p.tab || !p.day || !p.data) return false;
-      let savedData=null;
-      let savedStats=null;
-      if(p.patch && typeof p.patch==="object"){
-        await withDbTrackedWait(db.runTransaction(async tx=>{
-          const ref=checksRef(p.tab,p.day);
-          const snap=await tx.get(ref);
-          const current=(snap.exists&&snap.data()&&snap.data().data)?snap.data().data:{};
-          const next=JSON.parse(JSON.stringify(current));
-          Object.keys(p.patch).forEach(tId=>{ next[tId]=!!p.patch[tId]; });
-          const stats=countStats(p.tab,next);
-          tx.set(ref,{
-            data:next,stats,
-            updatedAt:firebase.firestore.FieldValue.serverTimestamp()
-          });
-          savedData=next;
-          savedStats=stats;
-        }),"pendingChecks-transaction-timeout");
-      }else{
-        const stats=p.stats||countStats(p.tab,p.data);
-        await withDbTrackedWait(checksRef(p.tab,p.day).set({
-          data:p.data,stats,
-          updatedAt:firebase.firestore.FieldValue.serverTimestamp()
-        }),"pendingChecks-set-timeout");
-        savedData=JSON.parse(JSON.stringify(p.data));
-        savedStats=stats;
-      }
-      if(p.day===todayStr && savedData){
-        todayChecked=JSON.parse(JSON.stringify(savedData));
+      const stats=p.stats||countStats(p.tab,p.data);
+      await withDbTrackedWait(checksRef(p.tab,p.day).set({
+        data:p.data,stats,
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      }),"pendingChecks-set-timeout");
+      if(p.day===todayStr){
+        todayChecked=JSON.parse(JSON.stringify(p.data));
         todayCheckedCache[p.tab]=todayChecked;
-        dateStats[p.day]=savedStats||countStats(p.tab,savedData);
+        dateStats[p.day]=stats;
         if(p.tab===currentTab){checkedMap=todayChecked;render();}
       }
       scheduleAutoBackup(p.tab);
@@ -3333,8 +3164,12 @@ function render(){
     }
     const id=el.getAttribute("data-id");
     pushUndo(currentTab);
-    const desired=!todayChecked[id];
-    applyOptimisticCheckPatch(currentTab,{[id]:desired});
+    await transactChecks(currentTab, (checks)=>{
+      checks[id] = !checks[id];
+      return checks;
+    });
+    checkedMap = todayChecked;
+    render();
   });
 });
 
@@ -3476,10 +3311,13 @@ function render(){
     const taskIds = sec.tasks.filter(t=>isTaskActiveToday(t.text)).map(t=>t.id);
     if(taskIds.length===0) return;
     pushUndo(currentTab);
-    const allDone=taskIds.every(tId=>todayChecked[tId]);
-    const patch={};
-    taskIds.forEach(tId=>{ patch[tId]=!allDone; });
-    applyOptimisticCheckPatch(currentTab,patch);
+    await transactChecks(currentTab, (checks)=>{
+      const allDone = taskIds.every(tId=>checks[tId]);
+      taskIds.forEach(tId=>{ checks[tId] = !allDone; });
+      return checks;
+    });
+    checkedMap = todayChecked;
+    render();
   });
 });
   main.querySelectorAll("[data-remove-task]").forEach(el=>{
@@ -6157,7 +5995,6 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
   });
   const pendingSyncClose=document.getElementById("pendingSyncClose");
   if(pendingSyncClose) pendingSyncClose.addEventListener("click",()=>document.getElementById("pendingSyncModal")?.classList.remove("show"));
-  recoverPendingSyncDrafts();
   renderPendingSyncBadge();
 
   const criticalModal=document.getElementById("criticalConfirmModal");
