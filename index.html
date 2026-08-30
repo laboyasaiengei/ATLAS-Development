@@ -11,7 +11,7 @@
 })();
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
-<title>圃場管理システム ATLAS - DEVELOPER BETA</title>
+<title>圃場管理システム ATLAS - Dev Beta 0.30</title>
 <meta name="robots" content="noindex, nofollow">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="shortcut icon" href="icons/favicon-32.png">
@@ -89,9 +89,20 @@
   font-size: 9.5px;
   letter-spacing: .02em;
   opacity: .75;
-  margin-top: 1px;
   white-space: nowrap;
 }
+  .brand-sub-row{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    margin-top:1px; width:100%;
+  }
+  .dev-version{
+    margin-left:auto; color:#ff7b7b; font-family:sans-serif; font-size:9.5px;
+    font-weight:800; letter-spacing:.035em; white-space:nowrap; opacity:1;
+  }
+  .loading-version{
+    color:#b52a2a; font-family:sans-serif; font-size:11px; font-weight:800;
+    letter-spacing:.04em; margin-top:-7px;
+  }
   .date-pill{
     font-size:10.5px; color:#e7f0e6; background:rgba(255,255,255,.08);
     padding:3px 8px; border-radius:999px; white-space:nowrap;
@@ -436,6 +447,33 @@
     font-family:"Noto Sans JP",sans-serif;
   }
 
+  .release-check-grid{display:grid;gap:8px;margin:10px 0 14px;}
+  .release-check-item{
+    display:flex;align-items:flex-start;gap:9px;border:1px solid var(--line);
+    border-radius:11px;padding:10px;background:var(--paper);font-size:12px;line-height:1.55;
+  }
+  .release-check-item input{margin-top:3px;transform:scale(1.08);}
+  .release-check-item b{display:block;color:var(--soil-800);margin-bottom:1px;}
+  .release-device-sub{display:flex;gap:14px;flex-wrap:wrap;margin-top:6px;font-size:11px;}
+  .release-field{margin:10px 0;}
+  .release-field label{display:block;font-size:11px;font-weight:700;color:var(--ink-soft);margin-bottom:4px;}
+  .release-field input,.release-field select,.release-field textarea{
+    width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:9px;
+    padding:9px;background:var(--paper);color:var(--ink);font:inherit;font-size:12px;
+  }
+  .release-field textarea{min-height:70px;resize:vertical;}
+  .release-save-btn{
+    width:100%;border:none;border-radius:10px;padding:11px;background:var(--leaf-600);
+    color:#fff;font-weight:800;cursor:pointer;margin-top:4px;
+  }
+  .release-save-btn:disabled{opacity:.45;cursor:default;}
+  .release-history-item{
+    border-top:1px solid var(--line);padding:10px 0;font-size:11px;line-height:1.55;
+  }
+  .release-history-item:first-child{border-top:none;}
+  .release-history-head{display:flex;justify-content:space-between;gap:8px;font-weight:800;}
+  .release-result-pass{color:#2e6f45}.release-result-conditional{color:#9a6b00}.release-result-fail{color:#a72b2b;}
+  .release-note{color:var(--ink-soft);white-space:pre-wrap;word-break:break-word;margin-top:4px;}
   .modal-overlay{
     position:fixed; inset:0; background:rgba(35,50,39,.45); z-index:70;
     display:none; align-items:flex-end; justify-content:center;
@@ -732,6 +770,7 @@ html[data-theme="dark"] .cal-dow{ color:#c3cdc0; }
 html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   
 </style>
+<!-- ATLAS Dev Beta 0.30: release-gate checklist and version visibility -->
 </head>
 <body>
 
@@ -740,6 +779,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
 <div class="app-loading-overlay" id="appLoadingOverlay">
   <div class="app-loading-spinner" id="appLoadingSpinner"></div>
   <div class="app-loading-text" id="appLoadingText">読み込み中…</div>
+  <div class="loading-version">Dev Beta 0.30</div>
   <div class="app-loading-step" id="appLoadingStep"></div>
   <div class="app-loading-error" id="appLoadingErrorBox" style="display:none;">
     <div class="app-loading-error-title">読み込みに時間がかかっています</div>
@@ -752,8 +792,8 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
 <header class="top">
   <div class="brand-row">
   <div class="brand">
-    <span class="brand-title-row">圃場管理システム ATLAS <span style="font-size:10px;font-weight:800;letter-spacing:.08em;opacity:.9;">DEVELOPER BETA</span><span class="date-pill" id="datePill">–</span></span>
-    <div class="brand-sub">Agricultural Task and Labor Administration System</div>
+    <span class="brand-title-row">圃場管理システム ATLAS <span class="date-pill" id="datePill">–</span></span>
+    <div class="brand-sub-row"><div class="brand-sub">Agricultural Task and Labor Administration System</div><div class="dev-version">Dev Beta 0.30</div></div>
   </div>
   <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
 </div>
@@ -925,6 +965,38 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <div class="modal-sub">名簿・特例日・集計設定を復元します(希望表・カレンダーの入力自体は対象外です)</div>
     <div id="dutyBackupList"></div>
     <button class="modal-close" id="closeDutyRestoreModal">閉じる</button>
+  </div>
+</div>
+
+<div class="modal-overlay" id="releaseCheckModal">
+  <div class="modal-sheet">
+    <div class="modal-title">リリース前チェック</div>
+    <div class="modal-sub">Dev Beta 0.30 を本線へ合流する前の確認記録です。自動デプロイは行いません。</div>
+
+    <div class="release-check-grid" id="releaseCheckGrid">
+      <label class="release-check-item"><input type="checkbox" data-release-check="startup"><span><b>1. 通常起動</b>起動時のエラーや不具合の確認</span></label>
+      <label class="release-check-item"><input type="checkbox" data-release-check="cultivation"><span><b>2. 栽培管理</b>朝・昼・夕の動作、チェック操作、タスク追加・編集・削除、バックアップの確認</span></label>
+      <label class="release-check-item"><input type="checkbox" data-release-check="duty"><span><b>3. 当番管理</b>希望表・カレンダー・スコアの動作、当番割当、期間累積などの確認</span></label>
+      <label class="release-check-item"><input type="checkbox" data-release-check="admin"><span><b>4. 管理者機能</b>管理者ログイン、パスワード、パスコード、名簿、特例日、期間設定</span></label>
+      <label class="release-check-item"><input type="checkbox" data-release-check="resilience"><span><b>5. 障害耐性</b>DEV診断、非常用モードなど</span></label>
+      <div class="release-check-item"><input type="checkbox" data-release-check="devices" id="releaseDevicesMain"><span style="flex:1"><b>6. 対象端末</b>問題児のiOS 18.7.10系と、問題のない別OSの両方で確認
+        <div class="release-device-sub">
+          <label><input type="checkbox" id="releaseDevice18710"> iOS/iPadOS 18.7.10系</label>
+          <label><input type="checkbox" id="releaseDeviceOther"> 別OS</label>
+        </div>
+      </span></div>
+      <label class="release-check-item"><input type="checkbox" data-release-check="known"><span><b>7. 重大な既知不具合</b>「なし」または本線投入してよい既知障害であることを確認</span></label>
+    </div>
+
+    <div class="release-field"><label for="releaseKnownIssues">重大な既知不具合</label><textarea id="releaseKnownIssues" placeholder="なし／または本線投入を許容する既知障害を記載"></textarea></div>
+    <div class="release-field"><label for="releaseChecker">確認者</label><input id="releaseChecker" type="text" placeholder="確認者名"></div>
+    <div class="release-field"><label for="releaseResult">結果</label><select id="releaseResult"><option value="">選択してください</option><option value="合格">合格</option><option value="条件付き合格">条件付き合格</option><option value="不合格">不合格</option></select></div>
+    <div class="release-field"><label for="releaseNote">備考</label><textarea id="releaseNote" placeholder="端末別の状況、許容した既知障害など"></textarea></div>
+    <button class="release-save-btn" id="releaseSaveBtn">チェック結果を記録</button>
+
+    <div style="margin-top:18px;font-weight:800;font-size:12px;">履歴</div>
+    <div id="releaseHistory"><div class="empty-note">履歴を読み込んでいません</div></div>
+    <button class="modal-close" id="releaseCheckClose">閉じる</button>
   </div>
 </div>
 
@@ -1740,7 +1812,7 @@ function syncDiagText(){
   const rows=[];
   const client=syncDetectClient();
   const currentErrors=syncCurrentErrors();
-  rows.push("環境: ATLAS DEVELOPER BETA");
+  rows.push("環境: ATLAS DEV BETA "+ATLAS_DEV_VERSION);
   rows.push("通信: "+(navigator.onLine?"オンライン":"オフライン"));
   rows.push("Firebase: "+(firebaseReady?"接続済み":"未接続"));
   rows.push("推定端末: "+client.device);
@@ -3867,6 +3939,113 @@ function unlockAdmin(){
 }
 function lockAdmin(){ isAdmin=false; sessionStorage.removeItem("dutyIsAdmin"); showToast("管理者モードをロックしました"); renderDutyPanel(); }
 
+/* ---- リリース前チェック ---- */
+const ATLAS_DEV_VERSION="0.30";
+function releaseChecksCol(){ return db.collection("developer_release_checks"); }
+function releaseResultClass(v){
+  return v==="合格"?"release-result-pass":v==="条件付き合格"?"release-result-conditional":"release-result-fail";
+}
+function releaseFormatTime(v){
+  try{
+    const d=v&&typeof v.toDate==="function"?v.toDate():new Date(v);
+    if(!d || isNaN(d.getTime())) return "—";
+    return d.toLocaleString("ja-JP");
+  }catch(e){return "—";}
+}
+function releaseChecklistState(){
+  const state={};
+  document.querySelectorAll("[data-release-check]").forEach(el=>state[el.dataset.releaseCheck]=!!el.checked);
+  state.device18710=!!document.getElementById("releaseDevice18710")?.checked;
+  state.deviceOther=!!document.getElementById("releaseDeviceOther")?.checked;
+  return state;
+}
+function updateReleaseDeviceMain(){
+  const a=!!document.getElementById("releaseDevice18710")?.checked;
+  const b=!!document.getElementById("releaseDeviceOther")?.checked;
+  const main=document.getElementById("releaseDevicesMain");
+  if(main) main.checked=a&&b;
+}
+async function openReleaseCheckModal(){
+  document.querySelectorAll("[data-release-check]").forEach(el=>el.checked=false);
+  const d1=document.getElementById("releaseDevice18710"); if(d1)d1.checked=false;
+  const d2=document.getElementById("releaseDeviceOther"); if(d2)d2.checked=false;
+  const ki=document.getElementById("releaseKnownIssues"); if(ki)ki.value="";
+  const checker=document.getElementById("releaseChecker"); if(checker)checker.value=myName||"";
+  const result=document.getElementById("releaseResult"); if(result)result.value="";
+  const note=document.getElementById("releaseNote"); if(note)note.value="";
+  document.getElementById("releaseCheckModal")?.classList.add("show");
+  await loadReleaseHistory();
+}
+async function loadReleaseHistory(){
+  const el=document.getElementById("releaseHistory");
+  if(!el) return;
+  el.innerHTML='<div class="empty-note">履歴を読み込み中…</div>';
+  try{
+    const snap=await withDbTrackedWait(
+      releaseChecksCol().orderBy("checkedAt","desc").limit(20).get(),
+      "releaseChecks-get-timeout"
+    );
+    if(snap.empty){el.innerHTML='<div class="empty-note">まだ履歴がありません</div>';return;}
+    let html="";
+    snap.forEach(doc=>{
+      const d=doc.data()||{};
+      html+=`<div class="release-history-item">
+        <div class="release-history-head"><span>Dev Beta ${escapeHtml(d.betaVersion||"—")}</span><span class="${releaseResultClass(d.result)}">${escapeHtml(d.result||"—")}</span></div>
+        <div>${escapeHtml(releaseFormatTime(d.checkedAt))} / 確認者: ${escapeHtml(d.checker||"—")}</div>
+        <div>確認: ${Number(d.checkedCount||0)}/7</div>
+        ${d.knownIssues?`<div class="release-note"><b>既知不具合:</b> ${escapeHtml(d.knownIssues)}</div>`:""}
+        ${d.note?`<div class="release-note"><b>備考:</b> ${escapeHtml(d.note)}</div>`:""}
+      </div>`;
+    });
+    el.innerHTML=html;
+  }catch(e){
+    el.innerHTML=`<div class="empty-note">履歴を取得できませんでした<br><small>${escapeHtml(e&&e.message?e.message:String(e))}</small></div>`;
+  }
+}
+async function saveReleaseCheck(){
+  if(!isAdmin || emergencyMode){showToast("管理者の通常モードで操作してください");return;}
+  const state=releaseChecklistState();
+  const checker=(document.getElementById("releaseChecker")?.value||"").trim();
+  const result=document.getElementById("releaseResult")?.value||"";
+  const knownIssues=(document.getElementById("releaseKnownIssues")?.value||"").trim();
+  const note=(document.getElementById("releaseNote")?.value||"").trim();
+  const mainKeys=["startup","cultivation","duty","admin","resilience","devices","known"];
+  const checkedCount=mainKeys.filter(k=>state[k]).length;
+
+  if(!checker){showToast("確認者を入力してください");return;}
+  if(!result){showToast("結果を選択してください");return;}
+  if(!state.device18710 || !state.deviceOther){
+    showToast("対象端末は18.7.10系と別OSの両方を確認してください");
+    return;
+  }
+  if(result==="合格" && checkedCount<7){
+    showToast("合格として記録するには7項目すべての確認が必要です");
+    return;
+  }
+  if(result==="条件付き合格" && !knownIssues && !note){
+    showToast("条件付き合格では既知不具合または備考を記載してください");
+    return;
+  }
+
+  const btn=document.getElementById("releaseSaveBtn");
+  if(btn){btn.disabled=true;btn.textContent="記録中…";}
+  try{
+    await withDbTrackedWait(releaseChecksCol().add({
+      betaVersion:ATLAS_DEV_VERSION,
+      checkedAt:firebase.firestore.FieldValue.serverTimestamp(),
+      checker,result,note,knownIssues,
+      checks:state,
+      checkedCount
+    }),"releaseChecks-add-timeout");
+    showToast("リリース前チェックを記録しました");
+    await loadReleaseHistory();
+  }catch(e){
+    toastFail("リリース前チェックの記録",e);
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent="チェック結果を記録";}
+  }
+}
+
 /* ---- 復元専用パスコード(管理者パスワードとは独立。圃場管理の「復元」ボタン用) ---- */
 const RESTORE_PASSCODE_DEFAULT = "1234"; // 初期パスコード（変更後はFirestore上の値が優先されます）
 let restorePasscodeCurrent = RESTORE_PASSCODE_DEFAULT;
@@ -5158,6 +5337,7 @@ async function renderScorePanel(el){
       <button class="lock-btn" id="rosterBtn">🔒 名簿を管理</button>
       <button class="lock-btn" id="pwChangeBtn">🔒 パスワード変更</button>
       <button class="lock-btn" id="restorePwChangeBtn">🔒 復元パスコード変更</button>
+      <button class="lock-btn" id="releaseCheckBtn">🚦 リリース前チェック</button>
     </div></div>` : ``}
     <div class="me-bar">
       集計期間:
@@ -5195,6 +5375,13 @@ async function renderScorePanel(el){
     restorePwChangeBtnEl.addEventListener("click", ()=>{
       if(!unlockAdmin()) return;
       startChangeRestorePasscode();
+    });
+  }
+  const releaseCheckBtnEl=document.getElementById("releaseCheckBtn");
+  if(releaseCheckBtnEl){
+    releaseCheckBtnEl.addEventListener("click", ()=>{
+      if(!unlockAdmin()) return;
+      openReleaseCheckModal();
     });
   }
   document.getElementById("periodSelect").addEventListener("change", (e)=>{
@@ -5986,6 +6173,21 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
     }catch(e){
       showToast("診断情報をコピーできませんでした");
     }
+  });
+
+  const releaseCheckClose=document.getElementById("releaseCheckClose");
+  if(releaseCheckClose) releaseCheckClose.addEventListener("click",()=>document.getElementById("releaseCheckModal")?.classList.remove("show"));
+  const releaseSaveBtn=document.getElementById("releaseSaveBtn");
+  if(releaseSaveBtn) releaseSaveBtn.addEventListener("click",saveReleaseCheck);
+  const releaseDevice18710=document.getElementById("releaseDevice18710");
+  const releaseDeviceOther=document.getElementById("releaseDeviceOther");
+  if(releaseDevice18710) releaseDevice18710.addEventListener("change",updateReleaseDeviceMain);
+  if(releaseDeviceOther) releaseDeviceOther.addEventListener("change",updateReleaseDeviceMain);
+  const releaseDevicesMain=document.getElementById("releaseDevicesMain");
+  if(releaseDevicesMain) releaseDevicesMain.addEventListener("change",()=>{
+    const v=releaseDevicesMain.checked;
+    if(releaseDevice18710) releaseDevice18710.checked=v;
+    if(releaseDeviceOther) releaseDeviceOther.checked=v;
   });
 
   const pendingSyncBadge=document.getElementById("pendingSyncBadge");
