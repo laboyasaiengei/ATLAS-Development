@@ -3454,16 +3454,28 @@ document.getElementById("closeModal").addEventListener("click", ()=>{
    ========================================================================= */
 
 /* ---- 権限まわり(簡易パスワード。必要に応じて下の値を書き換えてください) ---- */
-const ADMIN_PASSWORD  = "obungu_no_831";   // 初期パスワード（変更後はFirestore上の値が優先されます）
-let adminPasswordCurrent = ADMIN_PASSWORD;
+const ADMIN_PASSWORD  = "obungu_no_831";   // Firestoreに認証設定が存在しない初回だけ使用
+let adminPasswordCurrent = null;
+let adminPasswordLoaded = false;
+let adminPasswordLoadError = null;
 function adminAuthRef(){ return db.collection("duty_settings").doc("adminAuth"); }
 async function loadAdminPassword(){
+  adminPasswordLoaded = false;
+  adminPasswordLoadError = null;
   try{
-    const snap = await withDbTimeout(adminAuthRef().get(), "adminAuth-get-timeout");
+    const snap = await withDbTrackedWait(adminAuthRef().get(), "adminAuth-get-timeout");
     if(snap.exists && typeof snap.data().password==="string" && snap.data().password){
       adminPasswordCurrent = snap.data().password;
+    }else{
+      await withDbTrackedWait(adminAuthRef().set({ password: ADMIN_PASSWORD }), "adminAuth-init-set-timeout");
+      adminPasswordCurrent = ADMIN_PASSWORD;
     }
-  }catch(e){ /* オフライン時などは既定値のまま */ }
+    adminPasswordLoaded = true;
+  }catch(e){
+    adminPasswordCurrent = null;
+    adminPasswordLoadError = e;
+    adminPasswordLoaded = false;
+  }
 }
 async function changeAdminPassword(){
   const cur = prompt("現在の管理者パスワードを入力してください");
@@ -3476,8 +3488,10 @@ async function changeAdminPassword(){
   if(next2===null) return;
   if(next1!==next2){ showToast("新しいパスワードが一致しません"); return; }
   try{
-    await adminAuthRef().set({ password: next1 });
+    await withDbTrackedWait(adminAuthRef().set({ password: next1 }), "adminAuth-set-timeout");
     adminPasswordCurrent = next1;
+    adminPasswordLoaded = true;
+    adminPasswordLoadError = null;
     showToast("パスワードを変更しました");
   }catch(e){
     toastFail("管理者パスワードの変更", e);
@@ -3488,6 +3502,10 @@ let myName   = localStorage.getItem("dutyMyName") || "";
 function unlockAdmin(){
   if(emergencyMode){ showToast("非常用モードでは管理者操作できません"); return false; }
   if(isAdmin) return true;
+  if(!adminPasswordLoaded || !adminPasswordCurrent){
+    showToast(adminPasswordLoadError ? "管理者認証設定を取得できません。通信回復後に再読み込みしてください" : "管理者認証設定を読み込み中です");
+    return false;
+  }
   const pw = prompt("管理者パスワードを入力してください");
   if(pw===null) return false;
   if(pw===adminPasswordCurrent){
@@ -4339,6 +4357,45 @@ async function loadCalendarRange(dateStrs, force=false){
   }catch(e){ /* オフライン/エラー時は既存キャッシュのまま */ }
 }
 const scorePeriodCache = {};
+const periodDutyCountsCache = {};
+const periodDutyCountsInflight = {};
+function periodDutyCountKey(period){
+  return period ? (period.id || `${period.startYear}-${period.startMonth}-${period.endYear}-${period.endMonth}`) : "";
+}
+async function ensurePeriodDutyCounts(period, force=false){
+  if(!period) return {};
+  const key = periodDutyCountKey(period);
+  if(!force && periodDutyCountsCache[key]) return periodDutyCountsCache[key];
+  if(periodDutyCountsInflight[key]) return periodDutyCountsInflight[key];
+  const p=(async ()=>{
+    const allCal=await loadCalendarForScorePeriod(period,force);
+    const counts={};
+    roster.forEach(n=>{counts[n]=0;});
+    Object.keys(allCal||{}).forEach(ds=>{
+      if(!dateInPeriod(ds,period)) return;
+      (allCal[ds]||[]).forEach(name=>{counts[name]=(counts[name]||0)+1;});
+    });
+    periodDutyCountsCache[key]=counts;
+    return counts;
+  })();
+  periodDutyCountsInflight[key]=p;
+  try{return await p;}
+  finally{if(periodDutyCountsInflight[key]===p) delete periodDutyCountsInflight[key];}
+}
+function currentFiscalPeriod(){
+  if(selectedPeriodId && fiscalPresets.some(p=>p.id===selectedPeriodId)){
+    return fiscalPresets.find(p=>p.id===selectedPeriodId);
+  }
+  return fiscalPresets[0]||null;
+}
+async function warmCalendarAdminCounts(){
+  if(!isAdmin || emergencyMode) return;
+  try{
+    if(!fiscalPresetsLoaded) await loadFiscalPresets();
+    const period=currentFiscalPeriod();
+    if(period) ensurePeriodDutyCounts(period).catch(()=>{});
+  }catch(e){}
+}
 
 
 async function loadCalendarForScorePeriod(period, force=false){
@@ -4419,6 +4476,7 @@ async function saveCalendarDay(dateStr, people, markChanged){
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     Object.keys(scorePeriodCache).forEach(k=>delete scorePeriodCache[k]);
+    Object.keys(periodDutyCountsCache).forEach(k=>delete periodDutyCountsCache[k]);
     showToast(markChanged ? "変更マーク付きで保存しました" : "保存しました");
   }catch(e){
     // 保存失敗時は表示上の状態も元に戻す
@@ -4949,7 +5007,7 @@ async function renderCalendarPanel(el){
   el.querySelectorAll("[data-cal-date]").forEach(cell=>{
     cell.addEventListener("click", ()=>openCalendarDayModal(cell.getAttribute("data-cal-date")));
   });
-
+  warmCalendarAdminCounts();
 }
   async function openMonthDataModal(){
   const typeVal = prompt(
@@ -5026,30 +5084,17 @@ async function openCalendarDayModal(ds){
     bodyEl.innerHTML = infoHtml + `<div class="empty-note">読み込み中…</div>`;
     document.getElementById("calendarDayModal").classList.add("show");
 
-    // fiscalPresetsはスコア画面まで遅延読込しているため、
-    // 当番割当画面を先に開いた場合もここで必要分だけ取得する。
-    if(!fiscalPresetsLoaded) await loadFiscalPresets();
-
-    // 選択中の集計期間内回数 + 全履歴累積回数を割り振りの参考用に集計。
-    const currentPeriod = (selectedPeriodId && fiscalPresets.some(p=>p.id===selectedPeriodId))
-      ? fiscalPresets.find(p=>p.id===selectedPeriodId)
-      : (fiscalPresets[0] || null);
-    const allCal = currentPeriod ? await loadCalendarForScorePeriod(currentPeriod) : {};
-
     const monthCounts = {};
     roster.forEach(n=>{ monthCounts[n]=0; });
-    const targetYM = dateStr.slice(0,7);
+    const targetYM = ds.slice(0,7);
     Object.keys(calendarAssign).forEach(otherDs=>{
       if(otherDs.slice(0,7)!==targetYM) return;
       (calendarAssign[otherDs]||[]).forEach(name=>{ monthCounts[name]=(monthCounts[name]||0)+1; });
     });
 
-    const periodCounts = {};
-    roster.forEach(n=>{ periodCounts[n]=0; });
-    Object.keys(allCal).forEach(otherDs=>{
-      if(currentPeriod && !dateInPeriod(otherDs, currentPeriod)) return;
-      (allCal[otherDs]||[]).forEach(name=>{ periodCounts[name]=(periodCounts[name]||0)+1; });
-    });
+    const currentPeriod = currentFiscalPeriod();
+    const periodKey = periodDutyCountKey(currentPeriod);
+    const periodCounts = (periodKey && periodDutyCountsCache[periodKey]) ? periodDutyCountsCache[periodKey] : null;
 
     // この日に当番・すでに割り当て済みの人だけを候補にする。優先希望の人を先頭に並べる
     const pickList = roster.filter(n=>wanterNames.includes(n) || assigned.includes(n))
@@ -5061,7 +5106,7 @@ async function openCalendarDayModal(ds){
         <label for="calpick-${n}">${escapeHtml(n)}
           <span class="roster-count-pair">
             <span class="roster-count-badge" title="この月の担当回数">今月 ${monthCounts[n]||0}</span>
-            <span class="roster-count-badge" title="選択中の集計期間の累積担当回数">期間累積 ${periodCounts[n]||0}</span>
+            <span class="roster-count-badge" data-period-count-name="${escapeHtml(n)}" title="選択中の集計期間の累積担当回数">期間累積 ${periodCounts ? (periodCounts[n]||0) : "取得中"}</span>
           </span>
           ${prio[n]?" ★優先希望":(wanterNames.includes(n)?" (対応可能)":"")}
         </label>
@@ -5074,6 +5119,22 @@ async function openCalendarDayModal(ds){
       <button id="calDaySave" style="width:100%; margin-top:12px; border:none; background:var(--leaf-600); color:#fff; border-radius:10px; padding:11px; font-weight:700; cursor:pointer;">この内容で保存</button>`;
 
     bodyEl.innerHTML = infoHtml;
+
+    if(currentPeriod && !periodCounts){
+      ensurePeriodDutyCounts(currentPeriod).then(counts=>{
+        if(!document.getElementById("calendarDayModal").classList.contains("show")) return;
+        bodyEl.querySelectorAll("[data-period-count-name]").forEach(el=>{
+          const name=el.getAttribute("data-period-count-name");
+          el.textContent=`期間累積 ${counts[name]||0}`;
+        });
+      }).catch(()=>{
+        bodyEl.querySelectorAll("[data-period-count-name]").forEach(el=>{
+          el.textContent="期間累積 —";
+          el.title="期間累積を取得できませんでした";
+        });
+      });
+    }
+
     document.getElementById("calDaySave").addEventListener("click", async ()=>{
       const picked = pickList.filter(n=>document.getElementById(`calpick-${n}`).checked);
       const markChanged = document.getElementById("calChangeMark").checked;
