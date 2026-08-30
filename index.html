@@ -448,6 +448,16 @@
     display:block; width:100%; margin-top:14px; border:none; background:#efece2; color:var(--ink-soft);
     border-radius:12px; padding:12px; font-size:13.5px; cursor:pointer; font-weight:600;
   }
+  .critical-confirm-box{
+    border:1px solid var(--line); border-radius:12px; padding:12px 13px; margin:12px 0;
+    background:var(--paper); color:var(--ink); line-height:1.65; font-size:12px;
+  }
+  .critical-confirm-box .critical-label{font-weight:800; margin-bottom:5px;}
+  .critical-confirm-actions{display:flex; gap:8px; margin-top:12px;}
+  .critical-confirm-actions button{flex:1; border:none; border-radius:10px; padding:11px; font-weight:700; cursor:pointer;}
+  .critical-confirm-actions .critical-cancel{background:#f0ede4; color:var(--ink);}
+  .critical-confirm-actions .critical-next{background:var(--leaf-600); color:#fff;}
+  .critical-confirm-actions .critical-final{background:var(--alert); color:#fff;}
   .empty-note{text-align:center; color:var(--ink-soft); font-size:12.5px; padding:14px 10px 4px;}
 
   /* ---- 復元用パスコード入力 ---- */
@@ -797,6 +807,18 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <div class="emergency-info-box" id="emergencyInfoBox"></div>
     <button class="modal-close" id="emergencyEnterBtn">非常用データを表示</button>
     <button class="modal-close" id="emergencyCloseBtn">閉じる</button>
+  </div>
+</div>
+
+<div class="modal-overlay" id="criticalConfirmModal">
+  <div class="modal-sheet">
+    <div class="modal-title" id="criticalConfirmTitle">重要操作の確認</div>
+    <div class="modal-sub" id="criticalConfirmSub"></div>
+    <div class="critical-confirm-box" id="criticalConfirmDetail"></div>
+    <div class="critical-confirm-actions">
+      <button type="button" class="critical-cancel" id="criticalConfirmCancel">キャンセル</button>
+      <button type="button" class="critical-next" id="criticalConfirmNext">内容を確認して次へ</button>
+    </div>
   </div>
 </div>
 
@@ -2504,6 +2526,49 @@ function updateUndoBtn(){
   document.getElementById("undoBtn").disabled = isHistoryMode() || undoStacks[currentTab].length===0;
 }
 
+/* ---------- 重要操作の2段階確認 ---------- */
+let criticalConfirmResolve = null;
+let criticalConfirmStage = 1;
+let criticalConfirmSpec = null;
+
+function closeCriticalConfirm(result){
+  document.getElementById("criticalConfirmModal")?.classList.remove("show");
+  const resolve = criticalConfirmResolve;
+  criticalConfirmResolve = null;
+  criticalConfirmSpec = null;
+  criticalConfirmStage = 1;
+  if(resolve) resolve(!!result);
+}
+function renderCriticalConfirmStage(){
+  const spec=criticalConfirmSpec;
+  if(!spec) return;
+  const title=document.getElementById("criticalConfirmTitle");
+  const sub=document.getElementById("criticalConfirmSub");
+  const detail=document.getElementById("criticalConfirmDetail");
+  const next=document.getElementById("criticalConfirmNext");
+  if(criticalConfirmStage===1){
+    title.textContent=spec.title || "変更内容の確認";
+    sub.textContent="実行すると、次の内容が変更されます。";
+    detail.innerHTML=`<div class="critical-label">変更内容</div>${spec.detailHtml || ""}`;
+    next.textContent="内容を確認して次へ";
+    next.className="critical-next";
+  }else{
+    title.textContent="最終確認";
+    sub.textContent="この操作を本当に実行しますか？";
+    detail.innerHTML=`<div class="critical-label">${escapeHtml(spec.finalLabel || "この操作を実行します")}</div>${spec.finalHtml || "<div>実行前にもう一度確認してください。</div>"}`;
+    next.textContent=spec.finalButton || "実行する";
+    next.className="critical-final";
+  }
+}
+function confirmCriticalChange(spec){
+  if(criticalConfirmResolve) return Promise.resolve(false);
+  criticalConfirmSpec=spec||{};
+  criticalConfirmStage=1;
+  renderCriticalConfirmStage();
+  document.getElementById("criticalConfirmModal")?.classList.add("show");
+  return new Promise(resolve=>{ criticalConfirmResolve=resolve; });
+}
+
 function showToast(msg){
   const t=document.getElementById("toast");
   t.textContent=msg;
@@ -3092,7 +3157,14 @@ function render(){
     if(isHistoryMode()) return;
     const sId=el.getAttribute("data-del-section");
     const sec=structures[currentTab].find(s=>s.id===sId);
-    if(!confirm(`「${sec.name}」を削除します。よろしいですか？`)) return;
+    const ok=await confirmCriticalChange({
+      title:"場所を削除",
+      detailHtml:`<b>${escapeHtml(sec.name)}</b> を削除します。<br>この場所にあるタスク ${sec.tasks.length}件 と、本日のチェック状態も削除対象になります。`,
+      finalLabel:`「${sec.name}」を削除`,
+      finalHtml:"<div>削除後は直前操作の取り消しで戻せる場合がありますが、実行前に内容を確認してください。</div>",
+      finalButton:"削除する"
+    });
+    if(!ok) return;
     pushUndo(currentTab);
     const removedTaskIds = sec.tasks.map(t=>t.id);
     await transactStructure(currentTab, (sections)=>{
@@ -3363,7 +3435,14 @@ function renderBackupPreview(payload){
   `;
   document.getElementById("backupPreviewBack").addEventListener("click", ()=>renderBackupListPage());
   document.getElementById("backupPreviewRestore").addEventListener("click", async ()=>{
-    if(!confirm("このバックアップの内容で復元します。今の内容は上書きされます。よろしいですか？")) return;
+    const ok=await confirmCriticalChange({
+      title:"栽培管理データを復元",
+      detailHtml:`現在の <b>${escapeHtml(TAB_LABELS[currentTab]||currentTab)}</b> の栽培構成とチェック状態を、表示中のバックアップ内容で上書きします。`,
+      finalLabel:"現在の栽培管理内容を上書き",
+      finalHtml:"<div>復元を実行すると、現在表示中の内容がバックアップ内容へ置き換わります。</div>",
+      finalButton:"復元する"
+    });
+    if(!ok) return;
     try{
       pushUndo(currentTab);
       structures[currentTab]=payload.structure;
@@ -3658,7 +3737,14 @@ function renderRosterList(){
   listEl.querySelectorAll("[data-roster-del]").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
       const n = btn.getAttribute("data-roster-del");
-      if(!confirm(`「${n}」を名簿から削除します。よろしいですか？`)) return;
+      const ok=await confirmCriticalChange({
+        title:"名簿から削除",
+        detailHtml:`<b>${escapeHtml(n)}</b> を当番管理の名簿から削除します。`,
+        finalLabel:`「${n}」を名簿から削除`,
+        finalHtml:"<div>既存の当番記録は自動削除しませんが、今後の候補者一覧から外れます。</div>",
+        finalButton:"削除する"
+      });
+      if(!ok) return;
       pushDutyUndo();
       roster = roster.filter(x=>x!==n);
       await saveRoster();
@@ -3702,7 +3788,14 @@ function renderPeriodList(){
       const id = btn.getAttribute("data-period-del");
       const p = fiscalPresets.find(x=>x.id===id);
       if(!p) return;
-      if(!confirm(`「${periodLabelFor(p)}」を削除します。この期間の希望表・当番カレンダーのデータも完全に削除され、元に戻せません。よろしいですか？`)) return;
+      const ok=await confirmCriticalChange({
+        title:"集計期間を削除",
+        detailHtml:`<b>${escapeHtml(periodLabelFor(p))}</b> を削除します。<br>この期間に含まれる <b>希望表データと当番カレンダーデータも削除</b> されます。`,
+        finalLabel:"集計期間と関連データを完全削除",
+        finalHtml:"<div><b>この操作は元に戻せません。</b><br>対象期間の希望表・当番割当も同時に消去されます。</div>",
+        finalButton:"完全に削除する"
+      });
+      if(!ok) return;
       try{
         await purgeDutyDataForPeriod(p);
         fiscalPresets = fiscalPresets.filter(x=>x.id!==id);
@@ -3964,7 +4057,14 @@ function renderDutyBackupListPage(){
   });
   listEl.querySelectorAll("[data-duty-restore]").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
-      if(!confirm("このバックアップの内容で復元します。今の名簿・特例日・年度設定は上書きされます。よろしいですか？")) return;
+      const ok=await confirmCriticalChange({
+        title:"当番管理データを復元",
+        detailHtml:"現在の <b>名簿・特例日・年度設定・集計期間</b> を、選択したバックアップ内容で上書きします。",
+        finalLabel:"当番管理設定をバックアップで上書き",
+        finalHtml:"<div>復元後は現在の設定内容が置き換わります。</div>",
+        finalButton:"復元する"
+      });
+      if(!ok) return;
       try{
         const snap = await dutyBackupsCol().doc(btn.getAttribute("data-duty-restore")).get();
         const data = snap.data();
@@ -4898,7 +4998,15 @@ function renderSpecialDateList(){
   listEl.querySelectorAll("[data-sd-del]").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
       const ds = btn.getAttribute("data-sd-del");
-      if(!confirm(`${ds} の設定を削除します。よろしいですか？`)) return;
+      const sd=specialDates[ds]||{};
+      const ok=await confirmCriticalChange({
+        title:"特例日を削除",
+        detailHtml:`<b>${escapeHtml(ds)}</b>${sd.label?`（${escapeHtml(sd.label)}）`:""} の特例日設定を削除します。`,
+        finalLabel:`${ds} の特例日設定を削除`,
+        finalHtml:"<div>通常の土日・祝日判定そのものは変更されません。</div>",
+        finalButton:"削除する"
+      });
+      if(!ok) return;
       pushDutyUndo();
       try{ await specialDatesCol().doc(ds).delete(); delete specialDates[ds]; scheduleDutyAutoBackup(); renderSpecialDateList(); renderDutyPanel(); }
       catch(e){ toastFail("特例日の削除", e); }
@@ -5603,6 +5711,18 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
       showToast("診断情報をコピーしました");
     }catch(e){
       showToast("診断情報をコピーできませんでした");
+    }
+  });
+
+  const criticalCancel=document.getElementById("criticalConfirmCancel");
+  if(criticalCancel) criticalCancel.addEventListener("click",()=>closeCriticalConfirm(false));
+  const criticalNext=document.getElementById("criticalConfirmNext");
+  if(criticalNext) criticalNext.addEventListener("click",()=>{
+    if(criticalConfirmStage===1){
+      criticalConfirmStage=2;
+      renderCriticalConfirmStage();
+    }else{
+      closeCriticalConfirm(true);
     }
   });
 
