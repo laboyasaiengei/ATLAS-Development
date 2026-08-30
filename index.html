@@ -193,6 +193,23 @@
   .sync-status.state-offline .sync-dot{ background:var(--alert); }
   .sync-status .sync-label{ font-weight:700; }
   .sync-status .sync-detail{ opacity:.78; }
+  .pending-sync-badge{
+    display:none; border:none; border-radius:999px; padding:3px 7px; margin-left:2px;
+    background:#f3df9b; color:#6b5410; font-size:10px; font-weight:800; cursor:pointer;
+  }
+  .pending-sync-badge.show{ display:inline-flex; align-items:center; }
+  .pending-sync-item{
+    border:1px solid var(--line); border-radius:12px; padding:11px 12px; margin:8px 0;
+    background:var(--paper); font-size:12px; line-height:1.55;
+  }
+  .pending-sync-item .pending-title{font-weight:800;color:var(--soil-800);}
+  .pending-sync-item .pending-meta{color:var(--ink-soft);font-size:10.5px;margin-top:3px;}
+  .pending-sync-item .pending-detail{margin-top:6px;word-break:break-word;}
+  .pending-sync-actions{display:flex;gap:8px;margin-top:9px;}
+  .pending-sync-actions button{flex:1;border:none;border-radius:9px;padding:9px;font-weight:700;cursor:pointer;}
+  .pending-retry{background:var(--leaf-600);color:#fff;}
+  .pending-discard{background:#efece2;color:var(--ink-soft);}
+
   .diag-grid{ display:grid; grid-template-columns:minmax(92px,.8fr) minmax(0,1.6fr); gap:6px 10px; font-size:12px; line-height:1.55; }
   .diag-grid .k{ color:var(--ink-soft); }
   .diag-grid .v{ color:var(--ink); min-width:0; overflow-wrap:anywhere; }
@@ -792,6 +809,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <span class="sync-dot"></span>
     <span class="sync-label" id="syncStatusLabel">接続準備中</span>
     <span class="sync-detail" id="syncStatusDetail"></span>
+    <button type="button" class="pending-sync-badge" id="pendingSyncBadge">未同期あり</button>
   </div>
   <div class="emergency-launch" id="emergencyLaunch">
     <button type="button" id="emergencyOpenBtn">非常用モード</button>
@@ -809,6 +827,15 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <div class="emergency-info-box" id="emergencyInfoBox"></div>
     <button class="modal-close" id="emergencyEnterBtn">非常用データを表示</button>
     <button class="modal-close" id="emergencyCloseBtn">閉じる</button>
+  </div>
+</div>
+
+<div class="modal-overlay" id="pendingSyncModal">
+  <div class="modal-sheet">
+    <div class="modal-title">未同期データ</div>
+    <div class="modal-sub">保存に失敗した変更をこの端末に一時保管しています。自動再送は行いません。</div>
+    <div id="pendingSyncList"></div>
+    <button class="modal-close" id="pendingSyncClose">閉じる</button>
   </div>
 </div>
 
@@ -1727,6 +1754,7 @@ function syncDiagText(){
   rows.push("長時間応答待ち(15秒超・読込): "+syncDiag.longWaitReads);
   rows.push("長時間応答待ち(15秒超・保存): "+syncDiag.longWaitWrites);
   rows.push("現在エラー: "+(currentErrors.length?currentErrors.map(n=>n+"="+syncDiag.areas[n].currentError).join(" / "):"—"));
+  rows.push("未同期保護データ: "+pendingSyncRead().length+"件");
   rows.push("最終サーバー確認: "+syncFmtTime(syncDiag.lastServerConfirmAt,true));
   rows.push("最終読込成功: "+syncFmtTime(syncDiag.lastReadSuccessAt,true));
   rows.push("最終保存成功: "+syncFmtTime(syncDiag.lastWriteSuccessAt,true));
@@ -2258,18 +2286,24 @@ async function saveStructure(tab){
     }), "structure-set-timeout");
     scheduleAutoBackup(tab);
   }catch(e){
+    addPendingSync("structure",tab,{
+      tab,
+      sections:JSON.parse(JSON.stringify(structures[tab]||[]))
+    });
     connErrFail("栽培管理データの保存", e);
   }
 }
 async function transactStructure(tab, mutateFn){
   if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!firebaseReady){ showConfigWarningOnce(); return; }
+  let pendingSections=null;
   for(let attempt=1; attempt<=2; attempt++){
     try{
       await withDbTimeout(db.runTransaction(async (tx)=>{
         const snap = await tx.get(structureRef(tab));
         const current = (snap.exists && snap.data() && snap.data().sections) ? snap.data().sections : [];
         const updated = mutateFn(JSON.parse(JSON.stringify(current)));
+        pendingSections=JSON.parse(JSON.stringify(updated));
         tx.set(structureRef(tab), {
           sections: updated,
           updatedAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -2283,6 +2317,9 @@ async function transactStructure(tab, mutateFn){
         console.warn("栽培管理データの保存に失敗、少し待って再試行します:", e);
         await sleep(1200);
         continue;
+      }
+      if(pendingSections){
+        addPendingSync("structure",tab,{tab,sections:pendingSections});
       }
       connErrFail("栽培管理データの保存", e);
     }
@@ -2308,6 +2345,11 @@ async function saveChecks(tab){
         await sleep(1200);
         continue;
       }
+      addPendingSync("checks",tab+"_"+todayStr,{
+        tab,day:todayStr,
+        data:JSON.parse(JSON.stringify(todayChecked||{})),
+        stats:JSON.parse(JSON.stringify(stats||{}))
+      });
       connErrFail("本日のチェック状態の保存", e);
     }
   }
@@ -2317,9 +2359,8 @@ function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function transactChecks(tab, mutateFn){
   if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
   if(!firebaseReady){ showConfigWarningOnce(); return; }
-  // 起動直後など、端末の通信/IndexedDBがまだ本調子でないタイミングでは
-  // このトランザクションが単発で失敗することがある。少し間をおいて
-  // 1回だけ静かに再試行し、それでもダメな場合だけエラー表示に回す。
+  let pendingChecks=null;
+  let pendingStats=null;
   for(let attempt=1; attempt<=2; attempt++){
     try{
       await db.runTransaction(async (tx)=>{
@@ -2327,6 +2368,8 @@ function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
         const current = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
         const updated = mutateFn(JSON.parse(JSON.stringify(current)));
         const stats = countStats(tab, updated);
+        pendingChecks=JSON.parse(JSON.stringify(updated));
+        pendingStats=JSON.parse(JSON.stringify(stats));
         tx.set(checksRef(tab, todayStr), {
           data: updated,
           stats: stats,
@@ -2343,6 +2386,11 @@ function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
         console.warn("チェック状態の保存に失敗、少し待って再試行します:", e);
         await sleep(1200);
         continue;
+      }
+      if(pendingChecks){
+        addPendingSync("checks",tab+"_"+todayStr,{
+          tab,day:todayStr,data:pendingChecks,stats:pendingStats||{}
+        });
       }
       connErrFail("本日のチェック状態の保存", e);
     }
@@ -2526,6 +2574,181 @@ async function undo(){
 }
 function updateUndoBtn(){
   document.getElementById("undoBtn").disabled = isHistoryMode() || undoStacks[currentTab].length===0;
+}
+
+/* ---------- 未同期データの保護（手動再送のみ） ---------- */
+const PENDING_SYNC_LS_KEY="atlasPendingSyncV1";
+const PENDING_SYNC_MAX=20;
+
+function pendingSyncRead(){
+  try{
+    const raw=localStorage.getItem(PENDING_SYNC_LS_KEY);
+    const arr=raw?JSON.parse(raw):[];
+    return Array.isArray(arr)?arr:[];
+  }catch(e){ return []; }
+}
+function pendingSyncWrite(items){
+  try{
+    localStorage.setItem(PENDING_SYNC_LS_KEY,JSON.stringify((items||[]).slice(-PENDING_SYNC_MAX)));
+  }catch(e){}
+  renderPendingSyncBadge();
+}
+function pendingSyncKindLabel(kind){
+  return kind==="structure"?"栽培構成":kind==="checks"?"栽培チェック":kind==="calendar"?"当番カレンダー":"未同期データ";
+}
+function pendingSyncDetail(item){
+  const p=item.payload||{};
+  if(item.kind==="structure"){
+    const sections=Array.isArray(p.sections)?p.sections:[];
+    const tasks=sections.reduce((n,s)=>n+((s.tasks||[]).length),0);
+    return `${TAB_LABELS[p.tab]||p.tab||"—"} / 場所 ${sections.length}件・タスク ${tasks}件`;
+  }
+  if(item.kind==="checks"){
+    const vals=p.data||{};
+    const done=Object.keys(vals).filter(k=>vals[k]).length;
+    return `${TAB_LABELS[p.tab]||p.tab||"—"} / ${p.day||"—"} / 完了 ${done}件`;
+  }
+  if(item.kind==="calendar"){
+    const people=Array.isArray(p.people)?p.people:[];
+    return `${p.date||"—"} / 当番 ${people.length?people.join("・"):"未割当"}`;
+  }
+  return item.target||"";
+}
+function addPendingSync(kind,target,payload){
+  const items=pendingSyncRead();
+  const now=Date.now();
+  const item={
+    id:"ps_"+now.toString(36)+Math.random().toString(36).slice(2,6),
+    kind,target,payload,failedAt:now
+  };
+  const next=items.filter(x=>!(x.kind===kind && x.target===target));
+  next.push(item);
+  pendingSyncWrite(next);
+  showToast("保存できなかった変更を未同期データとして保護しました");
+  return item;
+}
+function removePendingSync(id){
+  pendingSyncWrite(pendingSyncRead().filter(x=>x.id!==id));
+}
+function renderPendingSyncBadge(){
+  const badge=document.getElementById("pendingSyncBadge");
+  if(!badge) return;
+  const n=pendingSyncRead().length;
+  badge.classList.toggle("show",n>0);
+  badge.textContent=n>0?`未同期あり ${n}`:"未同期あり";
+}
+function pendingSyncFmtTime(ms){
+  if(!ms) return "—";
+  try{return new Date(ms).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+  catch(e){return "—";}
+}
+function renderPendingSyncModal(){
+  const list=document.getElementById("pendingSyncList");
+  if(!list) return;
+  const items=pendingSyncRead();
+  if(!items.length){
+    list.innerHTML=`<div class="empty-note">未同期データはありません</div>`;
+    return;
+  }
+  list.innerHTML=items.slice().reverse().map(item=>`
+    <div class="pending-sync-item">
+      <div class="pending-title">${escapeHtml(pendingSyncKindLabel(item.kind))}</div>
+      <div class="pending-meta">保存失敗 ${escapeHtml(pendingSyncFmtTime(item.failedAt))}</div>
+      <div class="pending-detail">${escapeHtml(pendingSyncDetail(item))}</div>
+      <div class="pending-sync-actions">
+        <button class="pending-retry" data-pending-retry="${escapeHtml(item.id)}">再送</button>
+        <button class="pending-discard" data-pending-discard="${escapeHtml(item.id)}">破棄</button>
+      </div>
+    </div>`).join("");
+
+  list.querySelectorAll("[data-pending-retry]").forEach(btn=>{
+    btn.addEventListener("click",async ()=>{
+      const id=btn.getAttribute("data-pending-retry");
+      const item=pendingSyncRead().find(x=>x.id===id);
+      if(!item) return renderPendingSyncModal();
+      btn.disabled=true;
+      btn.textContent="再送中…";
+      const ok=await retryPendingSync(item);
+      if(ok){
+        removePendingSync(id);
+        showToast("未同期データを再送しました");
+      }else{
+        showToast("再送できませんでした。未同期データは保持します");
+      }
+      renderPendingSyncModal();
+    });
+  });
+
+  list.querySelectorAll("[data-pending-discard]").forEach(btn=>{
+    btn.addEventListener("click",async ()=>{
+      const id=btn.getAttribute("data-pending-discard");
+      const item=pendingSyncRead().find(x=>x.id===id);
+      if(!item) return renderPendingSyncModal();
+      const ok=await confirmCriticalChange({
+        title:"未同期データを破棄",
+        detailHtml:`<b>${escapeHtml(pendingSyncKindLabel(item.kind))}</b><br>${escapeHtml(pendingSyncDetail(item))}<br>保存に失敗した端末内の変更を破棄します。`,
+        finalLabel:"この未同期データを端末から削除",
+        finalHtml:"<div><b>破棄した内容は再送できません。</b></div>",
+        finalButton:"破棄する"
+      });
+      if(!ok) return;
+      removePendingSync(id);
+      renderPendingSyncModal();
+      showToast("未同期データを破棄しました");
+    });
+  });
+}
+async function retryPendingSync(item){
+  if(!item || emergencyMode || !firebaseReady || !navigator.onLine) return false;
+  const p=item.payload||{};
+  try{
+    if(item.kind==="structure"){
+      if(!p.tab || !Array.isArray(p.sections)) return false;
+      await withDbTrackedWait(structureRef(p.tab).set({
+        sections:p.sections,
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      }),"pendingStructure-set-timeout");
+      structures[p.tab]=JSON.parse(JSON.stringify(p.sections));
+      if(p.tab===currentTab) render();
+      scheduleAutoBackup(p.tab);
+      return true;
+    }
+    if(item.kind==="checks"){
+      if(!p.tab || !p.day || !p.data) return false;
+      const stats=p.stats||countStats(p.tab,p.data);
+      await withDbTrackedWait(checksRef(p.tab,p.day).set({
+        data:p.data,stats,
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      }),"pendingChecks-set-timeout");
+      if(p.day===todayStr){
+        todayChecked=JSON.parse(JSON.stringify(p.data));
+        todayCheckedCache[p.tab]=todayChecked;
+        dateStats[p.day]=stats;
+        if(p.tab===currentTab){checkedMap=todayChecked;render();}
+      }
+      scheduleAutoBackup(p.tab);
+      return true;
+    }
+    if(item.kind==="calendar"){
+      if(!p.date || !Array.isArray(p.people)) return false;
+      await withDbTrackedWait(calendarCol().doc(p.date).set({
+        people:p.people,
+        changed:!!p.changed,
+        previousPeople:Array.isArray(p.previousPeople)?p.previousPeople:[],
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      }),"pendingCalendar-set-timeout");
+      calendarAssign[p.date]=[...p.people];
+      calendarChanged[p.date]=!!p.changed;
+      calendarPrevious[p.date]=Array.isArray(p.previousPeople)?[...p.previousPeople]:[];
+      Object.keys(scorePeriodCache).forEach(k=>delete scorePeriodCache[k]);
+      Object.keys(periodDutyCountsCache).forEach(k=>delete periodDutyCountsCache[k]);
+      if(dutySub==="calendar") renderDutyPanel();
+      return true;
+    }
+  }catch(e){
+    return false;
+  }
+  return false;
 }
 
 /* ---------- 重要操作の2段階確認 ---------- */
@@ -4625,7 +4848,12 @@ async function saveCalendarDay(dateStr, people, markChanged){
     Object.keys(periodDutyCountsCache).forEach(k=>delete periodDutyCountsCache[k]);
     showToast(markChanged ? "変更マーク付きで保存しました" : "保存しました");
   }catch(e){
-    // 保存失敗時は表示上の状態も元に戻す
+    addPendingSync("calendar",dateStr,{
+      date:dateStr,
+      people:[...people],
+      changed:!!markChanged,
+      previousPeople:[...previousPeople]
+    });
     calendarAssign[dateStr] = prevPeople;
     calendarChanged[dateStr] = prevMarked;
     calendarPrevious[dateStr] = prevPrevious;
@@ -5759,6 +5987,15 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
       showToast("診断情報をコピーできませんでした");
     }
   });
+
+  const pendingSyncBadge=document.getElementById("pendingSyncBadge");
+  if(pendingSyncBadge) pendingSyncBadge.addEventListener("click",()=>{
+    renderPendingSyncModal();
+    document.getElementById("pendingSyncModal")?.classList.add("show");
+  });
+  const pendingSyncClose=document.getElementById("pendingSyncClose");
+  if(pendingSyncClose) pendingSyncClose.addEventListener("click",()=>document.getElementById("pendingSyncModal")?.classList.remove("show"));
+  renderPendingSyncBadge();
 
   const criticalModal=document.getElementById("criticalConfirmModal");
   if(criticalModal) criticalModal.addEventListener("click",(e)=>e.stopPropagation());
