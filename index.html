@@ -448,16 +448,6 @@
     display:block; width:100%; margin-top:14px; border:none; background:#efece2; color:var(--ink-soft);
     border-radius:12px; padding:12px; font-size:13.5px; cursor:pointer; font-weight:600;
   }
-  #syncConflictModal{ z-index:10080; }
-  #syncConflictModal .modal-sheet{ position:relative; z-index:10081; }
-  .sync-conflict-grid{display:grid;grid-template-columns:1fr;gap:8px;margin:12px 0;}
-  .sync-conflict-side{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:var(--paper);font-size:12px;line-height:1.6;}
-  .sync-conflict-side b{display:block;margin-bottom:3px;}
-  .sync-conflict-actions{display:flex;flex-direction:column;gap:8px;margin-top:12px;}
-  .sync-conflict-actions button{border:none;border-radius:10px;padding:11px;font-weight:700;cursor:pointer;}
-  .sync-conflict-use-remote{background:#efece2;color:var(--ink);}
-  .sync-conflict-use-local{background:var(--leaf-600);color:#fff;}
-  .sync-conflict-cancel{background:transparent;color:var(--ink-soft);border:1px solid var(--line)!important;}
   #criticalConfirmModal{ z-index:10050; }
   #criticalConfirmModal .modal-sheet{ position:relative; z-index:10051; }
   .critical-confirm-box{
@@ -819,22 +809,6 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <div class="emergency-info-box" id="emergencyInfoBox"></div>
     <button class="modal-close" id="emergencyEnterBtn">非常用データを表示</button>
     <button class="modal-close" id="emergencyCloseBtn">閉じる</button>
-  </div>
-</div>
-
-<div class="modal-overlay" id="syncConflictModal">
-  <div class="modal-sheet">
-    <div class="modal-title">同期競合を検出しました</div>
-    <div class="modal-sub" id="syncConflictSub">同じ対象が別の端末で先に変更されています</div>
-    <div class="sync-conflict-grid">
-      <div class="sync-conflict-side"><b>相手側の現在内容</b><div id="syncConflictRemote"></div></div>
-      <div class="sync-conflict-side"><b>自分が反映しようとしている内容</b><div id="syncConflictLocal"></div></div>
-    </div>
-    <div class="sync-conflict-actions">
-      <button type="button" class="sync-conflict-use-remote" id="syncConflictRemoteBtn">相手側の変更を採用</button>
-      <button type="button" class="sync-conflict-use-local" id="syncConflictLocalBtn">自分の変更で上書き</button>
-      <button type="button" class="sync-conflict-cancel" id="syncConflictCancelBtn">何もしない</button>
-    </div>
   </div>
 </div>
 
@@ -2554,171 +2528,6 @@ function updateUndoBtn(){
   document.getElementById("undoBtn").disabled = isHistoryMode() || undoStacks[currentTab].length===0;
 }
 
-/* ---------- 同一対象の同期競合検知 ---------- */
-let syncConflictResolve=null;
-
-function conflictValueText(v){
-  if(v===true) return "完了";
-  if(v===false) return "未完了";
-  if(v===null || typeof v==="undefined") return "—";
-  return String(v);
-}
-function openSyncConflict(spec){
-  if(syncConflictResolve) return Promise.resolve("cancel");
-  const modal=document.getElementById("syncConflictModal");
-  document.getElementById("syncConflictSub").textContent=spec.sub || "同じ対象が別の端末で先に変更されています";
-  document.getElementById("syncConflictRemote").innerHTML=spec.remoteHtml || "—";
-  document.getElementById("syncConflictLocal").innerHTML=spec.localHtml || "—";
-  if(modal){
-    document.body.appendChild(modal);
-    modal.classList.add("show");
-  }
-  return new Promise(resolve=>{syncConflictResolve=resolve;});
-}
-function closeSyncConflict(choice){
-  document.getElementById("syncConflictModal")?.classList.remove("show");
-  const r=syncConflictResolve;
-  syncConflictResolve=null;
-  if(r) r(choice);
-}
-function makeAtlasConflict(data){
-  const e=new Error("atlas-sync-conflict");
-  e.atlasSyncConflict=data;
-  return e;
-}
-function sameStringArray(a,b){
-  return JSON.stringify([...(a||[])].sort())===JSON.stringify([...(b||[])].sort());
-}
-function findTaskInSections(sections,sId,tId){
-  const s=(sections||[]).find(x=>x.id===sId);
-  return s ? s.tasks.find(x=>x.id===tId) : null;
-}
-function taskConflictHtml(task){
-  if(!task) return "このタスクは削除されています";
-  return `内容: <b>${escapeHtml(task.text||"")}</b><br>担当: ${escapeHtml(task.assignee||"未設定")}`;
-}
-function taskLabelById(tab,tId){
-  for(const s of (structures[tab]||[])){
-    const t=(s.tasks||[]).find(x=>x.id===tId);
-    if(t) return t.text||tId;
-  }
-  return tId;
-}
-
-async function transactTaskWithConflict(tab,sId,tId,baseTask,localHtml,mutateFn){
-  const run=async (guard)=>{
-    let updatedSections=null;
-    await withDbTimeout(db.runTransaction(async tx=>{
-      const snap=await tx.get(structureRef(tab));
-      const current=(snap.exists&&snap.data()&&snap.data().sections)?snap.data().sections:[];
-      const remote=findTaskInSections(current,sId,tId);
-      if(guard){
-        const baseExists=!!baseTask, remoteExists=!!remote;
-        const changed = baseExists!==remoteExists ||
-          (baseExists && remoteExists &&
-           ((baseTask.text||"")!==(remote.text||"") || (baseTask.assignee||"")!==(remote.assignee||"")));
-        if(changed){
-          throw makeAtlasConflict({
-            serverSections:JSON.parse(JSON.stringify(current)),
-            remoteTask:remote ? JSON.parse(JSON.stringify(remote)) : null
-          });
-        }
-      }
-      const next=mutateFn(JSON.parse(JSON.stringify(current)));
-      tx.set(structureRef(tab),{sections:next,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
-      updatedSections=next;
-    }),"structure-target-conflict-timeout");
-    if(updatedSections) structures[tab]=updatedSections;
-  };
-
-  try{
-    await run(true);
-    scheduleAutoBackup(tab);
-    return "saved";
-  }catch(e){
-    if(!e || !e.atlasSyncConflict) throw e;
-    const c=e.atlasSyncConflict;
-    const choice=await openSyncConflict({
-      sub:"同じタスクが別の端末で先に変更されています",
-      remoteHtml:taskConflictHtml(c.remoteTask),
-      localHtml:localHtml
-    });
-    if(choice==="remote"){
-      structures[tab]=c.serverSections;
-      if(tab===currentTab) render();
-      return "remote";
-    }
-    if(choice==="local"){
-      await run(false);
-      scheduleAutoBackup(tab);
-      return "saved";
-    }
-    return "cancel";
-  }
-}
-
-async function setChecksWithConflict(tab,desiredMap,baseMap){
-  let updatedChecks=null;
-  const run=async guard=>{
-    await withDbTimeout(db.runTransaction(async tx=>{
-      const snap=await tx.get(checksRef(tab,todayStr));
-      const current=(snap.exists&&snap.data()&&snap.data().data)?snap.data().data:{};
-      if(guard){
-        for(const tId of Object.keys(desiredMap)){
-          const remote=!!current[tId];
-          const base=!!baseMap[tId];
-          if(remote!==base){
-            throw makeAtlasConflict({
-              serverChecks:JSON.parse(JSON.stringify(current)),
-              taskId:tId,
-              remoteValue:remote,
-              localValue:!!desiredMap[tId]
-            });
-          }
-        }
-      }
-      const next=JSON.parse(JSON.stringify(current));
-      Object.keys(desiredMap).forEach(tId=>{next[tId]=!!desiredMap[tId];});
-      const stats=countStats(tab,next);
-      tx.set(checksRef(tab,todayStr),{data:next,stats,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
-      updatedChecks=next;
-    }),"checks-target-conflict-timeout");
-    if(updatedChecks){
-      todayChecked=updatedChecks;
-      todayCheckedCache[tab]=updatedChecks;
-      dateStats[todayStr]=countStats(tab,updatedChecks);
-    }
-  };
-
-  try{
-    await run(true);
-    scheduleAutoBackup(tab);
-    return "saved";
-  }catch(e){
-    if(!e || !e.atlasSyncConflict) throw e;
-    const c=e.atlasSyncConflict;
-    const label=taskLabelById(tab,c.taskId);
-    const choice=await openSyncConflict({
-      sub:`「${label}」のチェック状態が別端末で変更されています`,
-      remoteHtml:`${escapeHtml(label)}: <b>${conflictValueText(c.remoteValue)}</b>`,
-      localHtml:`${escapeHtml(label)}: <b>${conflictValueText(c.localValue)}</b>`
-    });
-    if(choice==="remote"){
-      todayChecked=c.serverChecks;
-      todayCheckedCache[tab]=c.serverChecks;
-      checkedMap=todayChecked;
-      render();
-      return "remote";
-    }
-    if(choice==="local"){
-      await run(false);
-      scheduleAutoBackup(tab);
-      return "saved";
-    }
-    return "cancel";
-  }
-}
-
 /* ---------- 重要操作の2段階確認 ---------- */
 let criticalConfirmResolve = null;
 let criticalConfirmStage = 1;
@@ -3131,16 +2940,13 @@ function render(){
       return;
     }
     const id=el.getAttribute("data-id");
-    const baseValue=!!todayChecked[id];
-    const desiredValue=!baseValue;
     pushUndo(currentTab);
-    try{
-      await setChecksWithConflict(currentTab,{[id]:desiredValue},{[id]:baseValue});
-      checkedMap=todayChecked;
-      render();
-    }catch(e){
-      connErrFail("チェック状態の保存",e);
-    }
+    await transactChecks(currentTab, (checks)=>{
+      checks[id] = !checks[id];
+      return checks;
+    });
+    checkedMap = todayChecked;
+    render();
   });
 });
 
@@ -3200,17 +3006,12 @@ function render(){
 
     const applyEditToCurrent = async ()=>{
       pushUndo(currentTab);
-      return await transactTaskWithConflict(
-        currentTab,sId,tId,
-        {text:originalText,assignee:originalAssignee},
-        `内容: <b>${escapeHtml(finalText)}</b><br>担当: ${escapeHtml(finalAssignee||"未設定")}`,
-        (sections)=>{
-          const s=sections.find(s=>s.id===sId);
-          const t=s?s.tasks.find(t=>t.id===tId):null;
-          if(t){t.text=finalText;t.assignee=finalAssignee;}
-          return sections;
-        }
-      );
+      await transactStructure(currentTab, (sections)=>{
+        const s = sections.find(s=>s.id===sId);
+        const t = s ? s.tasks.find(t=>t.id===tId) : null;
+        if(t){ t.text = finalText; t.assignee = finalAssignee; }
+        return sections;
+      });
     };
 
     // 他タブに同じ場所名・同じ(編集前の)内容+担当者のタスクがあれば、連動編集の候補として確認する
@@ -3235,15 +3036,14 @@ function render(){
     }
 
     if(matches.length===0){
-      const result=await applyEditToCurrent();
+      await applyEditToCurrent();
       render();
-      if(result==="saved") showToast("タスクを更新しました");
+      showToast("タスクを更新しました");
       return;
     }
 
     openTaskSyncModal(matches, async (selectedTabs)=>{
-      const result=await applyEditToCurrent();
-      if(result!=="saved") return;
+      await applyEditToCurrent();
       for(const t of selectedTabs){
         await transactStructure(t, (sections)=>{
           const s2 = sections.find(s=>s.name===sec.name);
@@ -3288,19 +3088,13 @@ function render(){
     const taskIds = sec.tasks.filter(t=>isTaskActiveToday(t.text)).map(t=>t.id);
     if(taskIds.length===0) return;
     pushUndo(currentTab);
-    const allDone=taskIds.every(tId=>todayChecked[tId]);
-    const desired={}, base={};
-    taskIds.forEach(tId=>{
-      base[tId]=!!todayChecked[tId];
-      desired[tId]=!allDone;
+    await transactChecks(currentTab, (checks)=>{
+      const allDone = taskIds.every(tId=>checks[tId]);
+      taskIds.forEach(tId=>{ checks[tId] = !allDone; });
+      return checks;
     });
-    try{
-      await setChecksWithConflict(currentTab,desired,base);
-      checkedMap=todayChecked;
-      render();
-    }catch(e){
-      connErrFail("チェック状態の保存",e);
-    }
+    checkedMap = todayChecked;
+    render();
   });
 });
   main.querySelectorAll("[data-remove-task]").forEach(el=>{
@@ -3313,21 +3107,14 @@ function render(){
 
     const removeFromCurrent = async ()=>{
       pushUndo(currentTab);
-      const result=await transactTaskWithConflict(
-        currentTab,sId,tId,
-        task ? {text:task.text||"",assignee:task.assignee||""} : null,
-        "このタスクを削除",
-        (sections)=>{
-          const sec=sections.find(s=>s.id===sId);
-          if(sec) sec.tasks=sec.tasks.filter(t=>t.id!==tId);
-          return sections;
-        }
-      );
-      if(result!=="saved") return result;
+      await transactStructure(currentTab, (sections)=>{
+        const sec = sections.find(s=>s.id===sId);
+        if(sec) sec.tasks = sec.tasks.filter(t=>t.id!==tId);
+        return sections;
+      });
       delete todayChecked[tId];
-      checkedMap=todayChecked;
+      checkedMap = todayChecked;
       await saveChecks(currentTab);
-      return "saved";
     };
 
     // 他タブに同じ場所名・同じ内容+担当者のタスクがあれば、連動削除の候補として確認する
@@ -3358,8 +3145,7 @@ function render(){
     }
 
     openTaskSyncModal(matches, async (selectedTabs)=>{
-      const result=await removeFromCurrent();
-      if(result!=="saved") return;
+      await removeFromCurrent();
       for(const t of selectedTabs){
         await transactStructure(t, (sections)=>{
           const sec = sections.find(s=>s.name===sourceSec.name);
@@ -4808,83 +4594,43 @@ async function purgeDutyDataForPeriod(period){
     await Promise.all(deletions);
   }
 }
-async function saveCalendarDay(dateStr, people, markChanged, baseState){
-  if(emergencyMode){ showToast("非常用モードでは変更できません"); return "cancel"; }
-  const prevPeople=calendarAssign[dateStr]||[];
-  const prevMarked=!!calendarChanged[dateStr];
-  const prevPrevious=calendarPrevious[dateStr]||[];
-  const assignmentChanged=!sameStringArray(prevPeople,people);
+async function saveCalendarDay(dateStr, people, markChanged){
+  if(emergencyMode){ showToast("非常用モードでは変更できません"); return; }
+  const prevPeople = calendarAssign[dateStr] || [];
+  const prevMarked = !!calendarChanged[dateStr];
+  const prevPrevious = calendarPrevious[dateStr] || [];
+  const assignmentChanged =
+    JSON.stringify([...prevPeople].sort()) !== JSON.stringify([...people].sort());
 
-  let previousPeople=[];
+  // 「変更」扱いは担当者が変わったかどうかではなく、管理者がチェックしたかで決める。
+  // これにより入力ミスの修正などを変更履歴として残さずに済む。
+  let previousPeople = [];
   if(markChanged){
-    if(assignmentChanged) previousPeople=[...prevPeople];
-    else if(prevMarked) previousPeople=[...prevPrevious];
+    if(assignmentChanged) previousPeople = [...prevPeople];
+    else if(prevMarked) previousPeople = [...prevPrevious];
   }
 
-  const desired={people:[...people],changed:!!markChanged,previousPeople:[...previousPeople]};
-  const base=baseState||{people:[...prevPeople],changed:prevMarked,previousPeople:[...prevPrevious]};
-
-  const run=async guard=>{
-    await withDbTimeout(db.runTransaction(async tx=>{
-      const ref=calendarCol().doc(dateStr);
-      const snap=await tx.get(ref);
-      const data=snap.exists?(snap.data()||{}):{};
-      const remote={
-        people:Array.isArray(data.people)?data.people:[],
-        changed:!!data.changed,
-        previousPeople:Array.isArray(data.previousPeople)?data.previousPeople:[]
-      };
-      const changedSinceOpen=
-        !sameStringArray(remote.people,base.people) ||
-        remote.changed!==base.changed ||
-        !sameStringArray(remote.previousPeople,base.previousPeople);
-      if(guard && changedSinceOpen){
-        throw makeAtlasConflict({remoteCalendar:remote});
-      }
-      tx.set(ref,{
-        people:desired.people,
-        changed:desired.changed,
-        previousPeople:desired.previousPeople,
-        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
-      });
-    }),"calendar-conflict-save-timeout");
-  };
+  calendarAssign[dateStr] = people;
+  calendarChanged[dateStr] = !!markChanged;
+  calendarPrevious[dateStr] = previousPeople;
 
   try{
-    await run(true);
-  }catch(e){
-    if(!e || !e.atlasSyncConflict){
-      toastFail("当番割り当ての保存",e);
-      return "error";
-    }
-    const remote=e.atlasSyncConflict.remoteCalendar;
-    const choice=await openSyncConflict({
-      sub:`${dateStr} の当番割当が別端末で先に変更されています`,
-      remoteHtml:`担当: <b>${escapeHtml(remote.people.length?remote.people.join("・"):"未割当")}</b>${remote.changed?"<br>変更マークあり":""}`,
-      localHtml:`担当: <b>${escapeHtml(desired.people.length?desired.people.join("・"):"未割当")}</b>${desired.changed?"<br>変更マークあり":""}`
+    await calendarCol().doc(dateStr).set({
+      people,
+      changed: !!markChanged,
+      previousPeople,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
-    if(choice==="remote"){
-      calendarAssign[dateStr]=remote.people;
-      calendarChanged[dateStr]=remote.changed;
-      calendarPrevious[dateStr]=remote.previousPeople;
-      renderDutyPanel();
-      return "remote";
-    }
-    if(choice==="local"){
-      try{await run(false);}
-      catch(err){toastFail("当番割り当ての保存",err);return "error";}
-    }else{
-      return "cancel";
-    }
+    Object.keys(scorePeriodCache).forEach(k=>delete scorePeriodCache[k]);
+    Object.keys(periodDutyCountsCache).forEach(k=>delete periodDutyCountsCache[k]);
+    showToast(markChanged ? "変更マーク付きで保存しました" : "保存しました");
+  }catch(e){
+    // 保存失敗時は表示上の状態も元に戻す
+    calendarAssign[dateStr] = prevPeople;
+    calendarChanged[dateStr] = prevMarked;
+    calendarPrevious[dateStr] = prevPrevious;
+    toastFail("当番割り当ての保存", e);
   }
-
-  calendarAssign[dateStr]=desired.people;
-  calendarChanged[dateStr]=desired.changed;
-  calendarPrevious[dateStr]=desired.previousPeople;
-  Object.keys(scorePeriodCache).forEach(k=>delete scorePeriodCache[k]);
-  Object.keys(periodDutyCountsCache).forEach(k=>delete periodDutyCountsCache[k]);
-  showToast(markChanged?"変更マーク付きで保存しました":"保存しました");
-  return "saved";
 }
 
 /* ---- 名前選択モーダル ---- */
@@ -5475,11 +5221,6 @@ async function openCalendarDayModal(ds){
   const wanterNames = Object.keys(wants).filter(n=>wants[n]);
   const prio = priorities[ds] || {};
   const assigned = calendarAssign[ds] || [];
-  const calendarEditBase={
-    people:[...assigned],
-    changed:!!calendarChanged[ds],
-    previousPeople:[...(calendarPrevious[ds]||[])]
-  };
 
   document.getElementById("calDayTitle").textContent = `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()}(${dow})`;
   const bodyEl = document.getElementById("calDayBody");
@@ -5551,11 +5292,9 @@ async function openCalendarDayModal(ds){
     document.getElementById("calDaySave").addEventListener("click", async ()=>{
       const picked = pickList.filter(n=>document.getElementById(`calpick-${n}`).checked);
       const markChanged = document.getElementById("calChangeMark").checked;
-      const result=await saveCalendarDay(ds,picked,markChanged,calendarEditBase);
-      if(result==="saved" || result==="remote"){
-        document.getElementById("calendarDayModal").classList.remove("show");
-        renderDutyPanel();
-      }
+      await saveCalendarDay(ds, picked, markChanged);
+      document.getElementById("calendarDayModal").classList.remove("show");
+      renderDutyPanel();
     });
   }else{
     infoHtml += `<div class="empty-note">当番を編集するには管理者パスワードが必要です</div>`;
@@ -6020,13 +5759,6 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
       showToast("診断情報をコピーできませんでした");
     }
   });
-
-  const syncConflictRemoteBtn=document.getElementById("syncConflictRemoteBtn");
-  if(syncConflictRemoteBtn) syncConflictRemoteBtn.addEventListener("click",()=>closeSyncConflict("remote"));
-  const syncConflictLocalBtn=document.getElementById("syncConflictLocalBtn");
-  if(syncConflictLocalBtn) syncConflictLocalBtn.addEventListener("click",()=>closeSyncConflict("local"));
-  const syncConflictCancelBtn=document.getElementById("syncConflictCancelBtn");
-  if(syncConflictCancelBtn) syncConflictCancelBtn.addEventListener("click",()=>closeSyncConflict("cancel"));
 
   const criticalModal=document.getElementById("criticalConfirmModal");
   if(criticalModal) criticalModal.addEventListener("click",(e)=>e.stopPropagation());
