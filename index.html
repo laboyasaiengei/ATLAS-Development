@@ -11,7 +11,7 @@
 })();
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
-<title>圃場管理システム ATLAS - Dev Beta 0.30</title>
+<title>圃場管理システム ATLAS - Dev Beta 0.31</title>
 <meta name="robots" content="noindex, nofollow">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="shortcut icon" href="icons/favicon-32.png">
@@ -770,7 +770,7 @@ html[data-theme="dark"] .cal-dow{ color:#c3cdc0; }
 html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   
 </style>
-<!-- ATLAS Dev Beta 0.30: release-gate checklist and version visibility -->
+<!-- ATLAS Dev Beta 0.31: release-gate checklist and version visibility -->
 </head>
 <body>
 
@@ -779,7 +779,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
 <div class="app-loading-overlay" id="appLoadingOverlay">
   <div class="app-loading-spinner" id="appLoadingSpinner"></div>
   <div class="app-loading-text" id="appLoadingText">読み込み中…</div>
-  <div class="loading-version">Dev Beta 0.30</div>
+  <div class="loading-version">Dev Beta 0.31</div>
   <div class="app-loading-step" id="appLoadingStep"></div>
   <div class="app-loading-error" id="appLoadingErrorBox" style="display:none;">
     <div class="app-loading-error-title">読み込みに時間がかかっています</div>
@@ -793,7 +793,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   <div class="brand-row">
   <div class="brand">
     <span class="brand-title-row">圃場管理システム ATLAS <span class="date-pill" id="datePill">–</span></span>
-    <div class="brand-sub-row"><div class="brand-sub">Agricultural Task and Labor Administration System</div><div class="dev-version">Dev Beta 0.30</div></div>
+    <div class="brand-sub-row"><div class="brand-sub">Agricultural Task and Labor Administration System</div><div class="dev-version">Dev Beta 0.31</div></div>
   </div>
   <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
 </div>
@@ -971,7 +971,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
 <div class="modal-overlay" id="releaseCheckModal">
   <div class="modal-sheet">
     <div class="modal-title">リリース前チェック</div>
-    <div class="modal-sub">Dev Beta 0.30 を本線へ合流する前の確認記録です。自動デプロイは行いません。</div>
+    <div class="modal-sub">Dev Beta 0.31 を本線へ合流する前の確認記録です。自動デプロイは行いません。</div>
 
     <div class="release-check-grid" id="releaseCheckGrid">
       <label class="release-check-item"><input type="checkbox" data-release-check="startup"><span><b>1. 通常起動</b>起動時のエラーや不具合の確認</span></label>
@@ -3844,14 +3844,16 @@ document.getElementById("undoBtn").addEventListener("click", ()=>{
   undo();
 });
 document.getElementById("backupBtn").addEventListener("click", ()=>createBackup(false));
-let restorePasscodeLoaded = false;
 async function ensureRestorePasscodeLoaded(){
-  if(restorePasscodeLoaded) return;
-  await loadRestorePasscode();
-  restorePasscodeLoaded = true;
+  if(restorePasscodeLoaded && restorePasscodeCurrent) return true;
+  return await loadRestorePasscode();
 }
 document.getElementById("restoreBtn").addEventListener("click", async ()=>{
-  await ensureRestorePasscodeLoaded();
+  const ok = await ensureRestorePasscodeLoaded();
+  if(!ok || !restorePasscodeCurrent){
+    showToast("復元用パスコードを取得できません。通信回復後に再試行してください");
+    return;
+  }
   openRestorePasscodeModal(()=> openRestoreModal());
 });
 document.getElementById("dateRefBtn").addEventListener("click", ()=>{
@@ -3940,7 +3942,7 @@ function unlockAdmin(){
 function lockAdmin(){ isAdmin=false; sessionStorage.removeItem("dutyIsAdmin"); showToast("管理者モードをロックしました"); renderDutyPanel(); }
 
 /* ---- リリース前チェック ---- */
-const ATLAS_DEV_VERSION="0.30";
+const ATLAS_DEV_VERSION="0.31";
 function releaseChecksCol(){ return db.collection("developer_release_checks"); }
 function releaseResultClass(v){
   return v==="合格"?"release-result-pass":v==="条件付き合格"?"release-result-conditional":"release-result-fail";
@@ -4047,21 +4049,55 @@ async function saveReleaseCheck(){
 }
 
 /* ---- 復元専用パスコード(管理者パスワードとは独立。圃場管理の「復元」ボタン用) ---- */
-const RESTORE_PASSCODE_DEFAULT = "1234"; // 初期パスコード（変更後はFirestore上の値が優先されます）
-let restorePasscodeCurrent = RESTORE_PASSCODE_DEFAULT;
+const RESTORE_PASSCODE_DEFAULT = "1234"; // Firestoreに設定が存在しない新規環境だけ使用
+let restorePasscodeCurrent = null;
+let restorePasscodeLoaded = false;
+let restorePasscodeLoadError = null;
+
 function restoreAuthRef(){ return db.collection("duty_settings").doc("restoreAuth"); }
+
 async function loadRestorePasscode(){
+  restorePasscodeLoaded = false;
+  restorePasscodeLoadError = null;
+
   try{
-    const snap = await withDbTimeout(restoreAuthRef().get(), "restoreAuth-get-timeout");
-    if(snap.exists && typeof snap.data().passcode==="string" && /^\d{4}$/.test(snap.data().passcode)){
+    // HTML内の初期値を一時的な有効パスコードとして使わず、
+    // Firestore上の設定を唯一の正として扱う。
+    const snap = await withDbTrackedWait(restoreAuthRef().get(), "restoreAuth-get-timeout");
+
+    if(snap.exists &&
+       typeof snap.data().passcode==="string" &&
+       /^\d{4}$/.test(snap.data().passcode)){
       restorePasscodeCurrent = snap.data().passcode;
+    }else{
+      // 本当に設定が存在しない新規環境だけ初期値1234を作成する。
+      await withDbTrackedWait(
+        restoreAuthRef().set({ passcode: RESTORE_PASSCODE_DEFAULT }),
+        "restoreAuth-init-set-timeout"
+      );
+      restorePasscodeCurrent = RESTORE_PASSCODE_DEFAULT;
     }
-  }catch(e){ /* オフライン時などは既定値のまま */ }
+
+    restorePasscodeLoaded = true;
+    restorePasscodeLoadError = null;
+    return true;
+  }catch(e){
+    restorePasscodeCurrent = null;
+    restorePasscodeLoaded = false;
+    restorePasscodeLoadError = e;
+    return false;
+  }
 }
+
 async function setRestorePasscode(newCode){
   try{
-    await restoreAuthRef().set({ passcode: newCode });
+    await withDbTrackedWait(
+      restoreAuthRef().set({ passcode: newCode }),
+      "restoreAuth-set-timeout"
+    );
     restorePasscodeCurrent = newCode;
+    restorePasscodeLoaded = true;
+    restorePasscodeLoadError = null;
     return true;
   }catch(e){
     toastFail("復元用パスコードの変更", e);
@@ -4087,6 +4123,12 @@ function shakeRestorePasscodeDots(msg){
   renderRestorePasscodeDots();
 }
 function openRestorePasscodeModal(onSuccess){
+  if(!restorePasscodeLoaded || !restorePasscodeCurrent){
+    showToast(restorePasscodeLoadError
+      ? "復元用パスコードを取得できません。通信回復後に再試行してください"
+      : "復元用パスコードを読み込み中です");
+    return;
+  }
   restorePasscodeInput = "";
   restorePasscodeMode = "unlock";
   restorePasscodeOnSuccess = onSuccess;
