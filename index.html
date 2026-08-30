@@ -583,6 +583,12 @@
   .roster-check-row label{ flex:1; min-width:0; }
   .roster-count-badge{ flex:0 0 auto; font-size:11px; font-weight:700; color:var(--leaf-600); background:var(--leaf-100); border-radius:999px; padding:3px 9px; white-space:nowrap; }
   .roster-count-circle{ margin-left:5px; font-size:13px; font-weight:700; color:var(--leaf-600); }
+  .roster-count-pair{ display:inline-flex; gap:4px; margin-left:6px; vertical-align:middle; flex-wrap:wrap; }
+  .roster-count-badge{
+    display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:999px;
+    padding:1px 5px; font-size:9.5px; font-weight:700; color:var(--ink-soft); background:var(--paper);
+    white-space:nowrap;
+  }
   .cal-day-info{ font-size:12.5px; color:var(--ink-soft); margin-bottom:10px; line-height:1.6; }
   .cal-day-info b{ color:var(--soil-800); }
   @media print{
@@ -4333,6 +4339,46 @@ async function loadCalendarRange(dateStrs, force=false){
   }catch(e){ /* オフライン/エラー時は既存キャッシュのまま */ }
 }
 const scorePeriodCache = {};
+
+/* ---- 当番回数の全履歴累積 ----
+   選択中の年度/集計期間とは別に、Firestoreへ残っている全当番記録を集計する。
+   画面を開くたびに全件readしないよう5分キャッシュし、当番保存時に破棄する。 */
+let allDutyHistoryCache = null;
+let allDutyHistoryLoadedAt = 0;
+const ALL_DUTY_HISTORY_CACHE_MS = 5 * 60 * 1000;
+
+async function loadAllDutyHistory(force=false){
+  if(emergencyMode){
+    return Object.assign({}, calendarAssign || {});
+  }
+  if(!force && allDutyHistoryCache && Date.now()-allDutyHistoryLoadedAt < ALL_DUTY_HISTORY_CACHE_MS){
+    return allDutyHistoryCache;
+  }
+  try{
+    const snap = await withDbTrackedWait(calendarCol().get(), "calendarAllHistory-get-timeout");
+    const map = {};
+    snap.forEach(doc=>{
+      const data = doc.data() || {};
+      map[doc.id] = Array.isArray(data.people) ? data.people : [];
+    });
+    allDutyHistoryCache = map;
+    allDutyHistoryLoadedAt = Date.now();
+    return map;
+  }catch(e){
+    return allDutyHistoryCache || Object.assign({}, calendarAssign || {});
+  }
+}
+
+function countDutyAssignments(calendarMap){
+  const counts = {};
+  roster.forEach(n=>{ counts[n]=0; });
+  Object.keys(calendarMap || {}).forEach(ds=>{
+    (calendarMap[ds] || []).forEach(name=>{
+      counts[name] = (counts[name] || 0) + 1;
+    });
+  });
+  return counts;
+}
 async function loadCalendarForScorePeriod(period, force=false){
   if(!period) return {};
   if(emergencyMode){
@@ -4410,6 +4456,9 @@ async function saveCalendarDay(dateStr, people, markChanged){
       previousPeople,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    allDutyHistoryCache = null;
+    allDutyHistoryLoadedAt = 0;
+    Object.keys(scorePeriodCache).forEach(k=>delete scorePeriodCache[k]);
     showToast(markChanged ? "変更マーク付きで保存しました" : "保存しました");
   }catch(e){
     // 保存失敗時は表示上の状態も元に戻す
@@ -4685,9 +4734,13 @@ async function renderScorePanel(el){
     ? selectedPeriodId
     : (fiscalPresets[0] ? fiscalPresets[0].id : null);
   const currentPeriod = fiscalPresets.find(p=>p.id===currentPeriodId) || null;
-  const allCal = currentPeriod ? await loadCalendarForScorePeriod(currentPeriod) : {};
+  const [allCal, allHistoryCal] = await Promise.all([
+    currentPeriod ? loadCalendarForScorePeriod(currentPeriod) : Promise.resolve({}),
+    loadAllDutyHistory()
+  ]);
   const scores = {}, counts = {};
   roster.forEach(n=>{ scores[n]=0; counts[n]=0; });
+  const lifetimeCounts = countDutyAssignments(allHistoryCal);
   if(currentPeriod){
     Object.keys(allCal).forEach(ds=>{
       if(!dateInPeriod(ds, currentPeriod)) return;
@@ -4703,7 +4756,8 @@ async function renderScorePanel(el){
   const rowsHtml = sorted.map((name)=>`
     <tr>
       <td>${escapeHtml(name)}</td>
-      <td>${counts[name]}回</td>
+      <td>${counts[name]||0}回</td>
+      <td><b>${lifetimeCounts[name]||0}回</b></td>
       <td><b>${scores[name]}</b>pt</td>
     </tr>`).join("");
   el.innerHTML = `
@@ -4726,10 +4780,10 @@ async function renderScorePanel(el){
       ${isAdmin ? `<button id="editPeriodBtn" class="lock-btn">🔒 編集</button>` : ``}
     </div>
     <table class="score-table">
-      <thead><tr><th>名前</th><th>回数</th><th>スコア</th></tr></thead>
-      <tbody>${rowsHtml || `<tr><td colspan="3" class="empty-note">この期間の当番記録がありません</td></tr>`}</tbody>
+      <thead><tr><th>名前</th><th>期間内</th><th>累積</th><th>スコア</th></tr></thead>
+      <tbody>${rowsHtml || `<tr><td colspan="4" class="empty-note">この期間の当番記録がありません</td></tr>`}</tbody>
     </table>
-    <div class="empty-note">基本は1日1ポイント、お盆や年末年始などはポイントアップします。集計は${currentPeriod ? periodLabelFor(currentPeriod) : "選択した"}の期間で記録されます</div>
+    <div class="empty-note">「期間内」は選択中の集計期間、「累積」はFirestoreに残る全当番記録の担当回数です。基本は1日1ポイント、お盆や年末年始などはポイントアップします。</div>
   `;
   const adminLockBtnEl=document.getElementById("adminLockBtn");
   if(adminLockBtnEl) adminLockBtnEl.addEventListener("click", ()=>{
@@ -5017,17 +5071,25 @@ async function openCalendarDayModal(ds){
     bodyEl.innerHTML = infoHtml + `<div class="empty-note">読み込み中…</div>`;
     document.getElementById("calendarDayModal").classList.add("show");
 
-        // 選択中の集計期間内での、これまでの累計当番回数を人ごとに集計(割り振りの参考用)
+    // fiscalPresetsはスコア画面まで遅延読込しているため、
+    // 当番割当画面を先に開いた場合もここで必要分だけ取得する。
+    if(!fiscalPresetsLoaded) await loadFiscalPresets();
+
+    // 選択中の集計期間内回数 + 全履歴累積回数を割り振りの参考用に集計。
     const currentPeriod = (selectedPeriodId && fiscalPresets.some(p=>p.id===selectedPeriodId))
       ? fiscalPresets.find(p=>p.id===selectedPeriodId)
       : (fiscalPresets[0] || null);
-    const allCal = currentPeriod ? await loadCalendarForScorePeriod(currentPeriod) : {};
-    const counts = {};
-    roster.forEach(n=>{ counts[n]=0; });
+    const [allCal, allHistoryCal] = await Promise.all([
+      currentPeriod ? loadCalendarForScorePeriod(currentPeriod) : Promise.resolve({}),
+      loadAllDutyHistory()
+    ]);
+    const periodCounts = {};
+    roster.forEach(n=>{ periodCounts[n]=0; });
     Object.keys(allCal).forEach(otherDs=>{
       if(currentPeriod && !dateInPeriod(otherDs, currentPeriod)) return;
-      (allCal[otherDs]||[]).forEach(name=>{ counts[name]=(counts[name]||0)+1; });
+      (allCal[otherDs]||[]).forEach(name=>{ periodCounts[name]=(periodCounts[name]||0)+1; });
     });
+    const lifetimeCounts = countDutyAssignments(allHistoryCal);
 
     // この日に当番・すでに割り当て済みの人だけを候補にする。優先希望の人を先頭に並べる
     const pickList = roster.filter(n=>wanterNames.includes(n) || assigned.includes(n))
@@ -5036,7 +5098,13 @@ async function openCalendarDayModal(ds){
     infoHtml += pickList.length ? pickList.map(n=>`
       <div class="roster-check-row">
         <input type="checkbox" id="calpick-${n}" ${assigned.includes(n)?"checked":""}>
-        <label for="calpick-${n}">${escapeHtml(n)}<span class="roster-count-circle" title="累計担当回数">${circledNumber(counts[n]||0)}</span>${prio[n]?" ★優先希望":(wanterNames.includes(n)?" (対応可能)":"")}</label>
+        <label for="calpick-${n}">${escapeHtml(n)}
+          <span class="roster-count-pair">
+            <span class="roster-count-badge" title="選択中の集計期間の担当回数">期間 ${periodCounts[n]||0}</span>
+            <span class="roster-count-badge" title="全履歴の累積担当回数">累積 ${lifetimeCounts[n]||0}</span>
+          </span>
+          ${prio[n]?" ★優先希望":(wanterNames.includes(n)?" (対応可能)":"")}
+        </label>
       </div>`).join("") : `<div class="empty-note">この日に当番がいません</div>`;
     infoHtml += `
       <label class="roster-check-row" for="calChangeMark" style="margin-top:10px; border-top:1px solid var(--line);">
