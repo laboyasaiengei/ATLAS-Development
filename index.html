@@ -11,7 +11,7 @@
 })();
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
-<title>栽培・当番管理システム ATLAS</title>
+<title>ATLAS Developer Beta - REST Test</title>
 <meta name="robots" content="noindex, nofollow">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="shortcut icon" href="icons/favicon-32.png">
@@ -711,9 +711,17 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   font-weight:700;
   white-space:nowrap;
 }
+
+  .rest-beta-env-badge{
+    display:inline-flex;align-items:center;justify-content:center;
+    margin-left:6px;padding:3px 7px;border-radius:999px;
+    background:#b42318;color:#fff;font-size:9px;font-weight:800;
+    letter-spacing:.03em;white-space:nowrap;
+  }
 </style>
   <!-- ATLAS stable v8: iOS 18.7.10 preference long-wait guard (single read / 30s) -->
   <!-- REST mainline experiment 0.1: preferences + calendar reads -->
+<!-- REST experiment: latest mainline source + Developer Beta Firebase ONLY -->
 </head>
 <body>
 
@@ -742,6 +750,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
+      <span class="rest-beta-env-badge">DEV BETA · REST TEST</span>
       <span class="date-pill" id="datePill">–</span>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
     </div>
@@ -1001,20 +1010,23 @@ function loadPdfLibs(){
         直接アクセス（アプリを経由しないアクセス）は防げます。
    ========================================================================= */
 const firebaseConfig = {
-  apiKey: "AIzaSyBsenI7Zp4ECZprIsM2kUVC-63ncIF8HvE",
-  authDomain: "kyujitukanri.firebaseapp.com",
-  projectId: "kyujitukanri",
-  storageBucket: "kyujitukanri.firebasestorage.app",
-  messagingSenderId: "643196836428",
-  appId: "1:643196836428:web:0f847a664907bb9dddf2e9"
+  apiKey: "AIzaSyBuT8QWh9ZPaJZd9kvs0HLLjfRHXHu02MA",
+  authDomain: "atlas-development-4eec2.firebaseapp.com",
+  projectId: "atlas-development-4eec2",
+  storageBucket: "atlas-development-4eec2.firebasestorage.app",
+  messagingSenderId: "707143868445",
+  appId: "1:707143868445:web:bec9e62bd61e79989aa6f4",
+  measurementId: "G-ZF7KGF8WKZ"
 };
+const EXPECTED_ATLAS_ENV = "DEVELOPER_BETA";
+const EXPECTED_FIREBASE_PROJECT_ID = "atlas-development-4eec2";
 // Firebase Console → App Check → このアプリを登録 → reCAPTCHA v3 で発行されたサイトキーを貼る
 const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // ローカルで動作確認する時だけ有効化（本番公開時はコメントアウトのままでOK）
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "039"; // internal build tag — do not remove
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-001-FIX"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1106,8 +1118,24 @@ async function initFirebase(){
     showConfigBanner();
     return;
   }
+
+  // REST実験枝はDeveloper Beta専用。
+  // 本線Firebase設定が誤って混入した場合は、データ混線防止のため接続自体を拒否する。
+  if(firebaseConfig.projectId !== EXPECTED_FIREBASE_PROJECT_ID){
+    const msg = "安全停止: Developer Beta以外のFirebase設定を検出しました。\n接続を中止します。";
+    console.error(msg, firebaseConfig.projectId);
+    setLoadingStep("安全停止: Firebase環境が不一致です");
+    const detail = document.getElementById("appLoadingErrorDetail");
+    const box = document.getElementById("appLoadingErrorBox");
+    const spinner = document.getElementById("appLoadingSpinner");
+    if(detail) detail.textContent = msg;
+    if(box) box.style.display = "";
+    if(spinner) spinner.style.display = "none";
+    return;
+  }
+
   try{
-    setLoadingStep("Firebaseに接続中…");
+    setLoadingStep("Developer Beta Firebaseに接続中…");
     firebase.initializeApp(firebaseConfig);
     if(RECAPTCHA_V3_SITE_KEY && RECAPTCHA_V3_SITE_KEY !== "YOUR_RECAPTCHA_V3_SITE_KEY"){
       firebase.appCheck().activate(RECAPTCHA_V3_SITE_KEY, true);
