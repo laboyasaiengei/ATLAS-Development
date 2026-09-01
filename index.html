@@ -1054,7 +1054,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-002-DIAGNOSTICS"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-003-STARTUP-DIAGNOSTICS"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1082,7 +1082,16 @@ function withTimeout(promise, ms, tag){
 // バック)に処理を戻す。
 const FS_OP_TIMEOUT_MS = 6000;
 function withDbTimeout(promise, tag){
-  return withTimeout(promise, FS_OP_TIMEOUT_MS, tag);
+  const s=performance.now();
+  return withTimeout(promise, FS_OP_TIMEOUT_MS, tag).then(v=>{
+    if(!atlasDevDiag.startup.readyAt && /get|read|load|Range|Settings|Checks|structure|roster|special|Auth|Deadline|meta/i.test(tag||""))
+      atlasStartupRecord("SDK",tag,Math.round(performance.now()-s),"success","");
+    return v;
+  }).catch(e=>{
+    if(!atlasDevDiag.startup.readyAt && /get|read|load|Range|Settings|Checks|structure|roster|special|Auth|Deadline|meta/i.test(tag||""))
+      atlasStartupRecord("SDK",tag,Math.round(performance.now()-s),"error",e.message||String(e));
+    throw e;
+  });
 }
 // タブ切り替え時など「失敗すると表示が崩れる/固まる」重要な読み込みは、
 // 1回タイムアウトしただけで諦めず、少し間をおいて1回だけ再試行する。
@@ -3161,11 +3170,10 @@ function prefDeadlineLabel(){
    ========================================================================= */
 
 const atlasDevDiag={
-  startedAt:Date.now(),
-  recent:[],
-  seq:0,
+  startedAt:Date.now(), recent:[], seq:0,
   preferences:{route:"—",ms:null,count:null,ok:0,fail:0,fallback:0,error:""},
-  calendar:{route:"—",ms:null,count:null,ok:0,fail:0,fallback:0,error:""}
+  calendar:{route:"—",ms:null,count:null,ok:0,fail:0,fallback:0,error:""},
+  startup:{readyAt:null,totalMs:null,reads:[],sdkReads:0,restReads:0}
 };
 function atlasDiagPush(area,status,ms,tag,extra){
   atlasDevDiag.recent.unshift({id:++atlasDevDiag.seq,at:Date.now(),area,status,ms,tag,extra:extra||""});
@@ -3175,18 +3183,33 @@ function atlasDiagTime(ts){
   if(!ts) return "—";
   try{return new Date(ts).toLocaleTimeString("ja-JP",{hour12:false});}catch(e){return "—";}
 }
+function atlasStartupRecord(route,label,ms,status,extra){
+  atlasDevDiag.startup.reads.push({route,label,ms,status,at:Date.now(),extra:extra||""});
+  if(atlasDevDiag.startup.reads.length>40) atlasDevDiag.startup.reads.shift();
+  if(route==="SDK") atlasDevDiag.startup.sdkReads++;
+  if(route==="REST") atlasDevDiag.startup.restReads++;
+}
+function atlasMarkAppReady(){
+  if(atlasDevDiag.startup.readyAt) return;
+  atlasDevDiag.startup.readyAt=Date.now();
+  atlasDevDiag.startup.totalMs=atlasDevDiag.startup.readyAt-atlasDevDiag.startedAt;
+}
 function atlasDiagText(){
   const p=atlasDevDiag.preferences,c=atlasDevDiag.calendar;
   const ua=navigator.userAgent||"—";
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.1 / Latest Mainline Source",
+    "環境: ATLAS REST BETA TEST 0.2 / Latest Mainline Source",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
     "Firebase: "+(firebaseReady?"接続済み":"未接続"),
     "Safari: "+safari+" / WebKit: "+webkit,
+    "",
+    "起動完了まで: "+(atlasDevDiag.startup.totalMs==null?"計測中":atlasDevDiag.startup.totalMs+"ms"),
+    "起動中SDK読込: "+atlasDevDiag.startup.sdkReads+"件",
+    "起動中REST読込: "+atlasDevDiag.startup.restReads+"件",
     "",
     "希望表読取経路: "+p.route,
     "希望表最終所要時間: "+(p.ms==null?"—":p.ms+"ms"),
@@ -3200,8 +3223,11 @@ function atlasDiagText(){
     "カレンダーREST成功/失敗: "+c.ok+"/"+c.fail+" / SDK fallback成功="+c.fallback,
     "カレンダーREST最終エラー: "+(c.error||"—"),
     "",
-    "[直近REST/フォールバック処理]"
+    "[起動時読込]"
   ];
+  atlasDevDiag.startup.reads.forEach(r=>rows.push(atlasDiagTime(r.at)+" "+r.route+" "+r.status+" "+r.ms+"ms "+r.label+(r.extra?" / "+r.extra:"")));
+  rows.push("");
+  rows.push("[直近REST/フォールバック処理]");
   atlasDevDiag.recent.forEach(r=>{
     rows.push("#"+r.id+" "+atlasDiagTime(r.at)+" "+r.area+" "+r.status+" "+r.ms+"ms "+r.tag+(r.extra?" / "+r.extra:""));
   });
@@ -3230,7 +3256,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.1";
+const ATLAS_REST_MAINLINE_VERSION = "0.2";
 const REST_READ_TIMEOUT_MS = 12000;
 
 function atlasRestTimeout(promise, ms, label){
@@ -3278,6 +3304,7 @@ function atlasDecodeFirestoreDocument(doc){
   return out;
 }
 async function atlasFetchCollectionRangeREST(collection,startId,endId){
+  const atlasRestStarted=performance.now();
   const headers=await atlasRestAuthHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:runQuery`;
   const controller=new AbortController();
@@ -3300,6 +3327,7 @@ async function atlasFetchCollectionRangeREST(collection,startId,endId){
       if(!row||!row.document||!row.document.name) return;
       docs.push({id:row.document.name.split("/").pop(),data:atlasDecodeFirestoreDocument(row.document)});
     });
+    if(!atlasDevDiag.startup.readyAt) atlasStartupRecord("REST",collection+"Range-rest",Math.round(performance.now()-atlasRestStarted),"success",docs.length+"件");
     return docs;
   }finally{ clearTimeout(timer); }
 }
@@ -4485,6 +4513,7 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
   if(retryBtn) retryBtn.addEventListener("click", ()=> window.location.reload());
 
   const hideOverlayNow = ()=>{
+    atlasMarkAppReady();
     const overlay = document.getElementById("appLoadingOverlay");
     if(overlay) overlay.classList.add("hide");
   };
