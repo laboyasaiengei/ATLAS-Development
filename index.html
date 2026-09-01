@@ -718,6 +718,19 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     background:#b42318;color:#fff;font-size:9px;font-weight:800;
     letter-spacing:.03em;white-space:nowrap;
   }
+
+  .dev-diag-btn{
+    border:1px solid rgba(255,255,255,.35);background:rgba(180,35,24,.92);color:#fff;
+    border-radius:999px;padding:4px 8px;font-size:9px;font-weight:800;cursor:pointer;white-space:nowrap;
+  }
+  .dev-diag-overlay{position:fixed;inset:0;background:rgba(0,0,0,.58);display:none;align-items:flex-end;justify-content:center;z-index:99999;padding:12px;}
+  .dev-diag-overlay.show{display:flex;}
+  .dev-diag-sheet{width:min(760px,100%);max-height:88vh;overflow:auto;background:#fff;color:#1f2937;border-radius:18px;padding:16px;box-shadow:0 18px 60px rgba(0,0,0,.35);}
+  .dev-diag-sheet h2{margin:0 0 4px;font-size:18px;}
+  .dev-diag-sub{font-size:11px;color:#6b7280;margin-bottom:10px;}
+  .dev-diag-pre{white-space:pre-wrap;word-break:break-word;background:#f3f4f6;border-radius:12px;padding:12px;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .dev-diag-actions{display:flex;gap:8px;margin-top:10px;}
+  .dev-diag-actions button{flex:1;border:0;border-radius:10px;padding:10px;font-weight:800;cursor:pointer;}
 </style>
   <!-- ATLAS stable v8: iOS 18.7.10 preference long-wait guard (single read / 30s) -->
   <!-- REST mainline experiment 0.1: preferences + calendar reads -->
@@ -751,6 +764,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     </div>
     <div class="brand-controls">
       <span class="rest-beta-env-badge">DEV BETA · REST TEST</span>
+      <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
     </div>
@@ -930,6 +944,20 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   </div>
 </div>
 
+
+<div class="dev-diag-overlay" id="devDiagModal">
+  <div class="dev-diag-sheet">
+    <h2>Developer Diagnostics</h2>
+    <div class="dev-diag-sub">Developer Beta / REST実験経路の状態確認</div>
+    <div class="dev-diag-pre" id="devDiagBody">診断情報を準備中…</div>
+    <div class="dev-diag-actions">
+      <button id="devDiagRefresh" type="button">更新</button>
+      <button id="devDiagCopy" type="button">コピー</button>
+      <button id="devDiagClose" type="button">閉じる</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <!-- Firebase SDK (compat版。設定は下部スクリプト内 firebaseConfig を参照) -->
@@ -1026,7 +1054,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-001-FIX"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-002-DIAGNOSTICS"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -3131,6 +3159,77 @@ function prefDeadlineLabel(){
    書き込み/transaction/リアルタイム同期等は従来 Web SDK のまま維持する。
    REST失敗時は既存Web SDK読取へフォールバックする。
    ========================================================================= */
+
+const atlasDevDiag={
+  startedAt:Date.now(),
+  recent:[],
+  seq:0,
+  preferences:{route:"—",ms:null,count:null,ok:0,fail:0,fallback:0,error:""},
+  calendar:{route:"—",ms:null,count:null,ok:0,fail:0,fallback:0,error:""}
+};
+function atlasDiagPush(area,status,ms,tag,extra){
+  atlasDevDiag.recent.unshift({id:++atlasDevDiag.seq,at:Date.now(),area,status,ms,tag,extra:extra||""});
+  atlasDevDiag.recent=atlasDevDiag.recent.slice(0,20);
+}
+function atlasDiagTime(ts){
+  if(!ts) return "—";
+  try{return new Date(ts).toLocaleTimeString("ja-JP",{hour12:false});}catch(e){return "—";}
+}
+function atlasDiagText(){
+  const p=atlasDevDiag.preferences,c=atlasDevDiag.calendar;
+  const ua=navigator.userAgent||"—";
+  const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
+  const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
+  const rows=[
+    "環境: ATLAS REST BETA TEST 0.1 / Latest Mainline Source",
+    "Firebase project: "+(firebaseConfig.projectId||"—"),
+    "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
+    "通信: "+(navigator.onLine?"オンライン":"オフライン"),
+    "Firebase: "+(firebaseReady?"接続済み":"未接続"),
+    "Safari: "+safari+" / WebKit: "+webkit,
+    "",
+    "希望表読取経路: "+p.route,
+    "希望表最終所要時間: "+(p.ms==null?"—":p.ms+"ms"),
+    "希望表最終取得件数: "+(p.count==null?"—":p.count+"件"),
+    "希望表REST成功/失敗: "+p.ok+"/"+p.fail+" / SDK fallback成功="+p.fallback,
+    "希望表REST最終エラー: "+(p.error||"—"),
+    "",
+    "カレンダー読取経路: "+c.route,
+    "カレンダー最終所要時間: "+(c.ms==null?"—":c.ms+"ms"),
+    "カレンダー最終取得件数: "+(c.count==null?"—":c.count+"件"),
+    "カレンダーREST成功/失敗: "+c.ok+"/"+c.fail+" / SDK fallback成功="+c.fallback,
+    "カレンダーREST最終エラー: "+(c.error||"—"),
+    "",
+    "[直近REST/フォールバック処理]"
+  ];
+  atlasDevDiag.recent.forEach(r=>{
+    rows.push("#"+r.id+" "+atlasDiagTime(r.at)+" "+r.area+" "+r.status+" "+r.ms+"ms "+r.tag+(r.extra?" / "+r.extra:""));
+  });
+  rows.push("");
+  rows.push("User Agent: "+ua);
+  return rows.join("\n");
+}
+function renderAtlasDevDiag(){
+  const el=document.getElementById("devDiagBody");
+  if(el) el.textContent=atlasDiagText();
+}
+function initAtlasDevDiagUI(){
+  const btn=document.getElementById("devDiagBtn");
+  const modal=document.getElementById("devDiagModal");
+  const refresh=document.getElementById("devDiagRefresh");
+  const copy=document.getElementById("devDiagCopy");
+  const close=document.getElementById("devDiagClose");
+  if(btn) btn.addEventListener("click",()=>{renderAtlasDevDiag();modal&&modal.classList.add("show");});
+  if(refresh) refresh.addEventListener("click",renderAtlasDevDiag);
+  if(close) close.addEventListener("click",()=>modal&&modal.classList.remove("show"));
+  if(copy) copy.addEventListener("click",async()=>{
+    const s=atlasDiagText();
+    try{await navigator.clipboard.writeText(s); if(typeof showToast==="function") showToast("診断情報をコピーしました");}
+    catch(e){window.prompt("診断情報をコピーしてください",s);}
+  });
+}
+document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
+
 const ATLAS_REST_MAINLINE_VERSION = "0.1";
 const REST_READ_TIMEOUT_MS = 12000;
 
@@ -3231,9 +3330,18 @@ async function loadPreferencesRange(dateStrs){
   const wanted=new Set(dateStrs);
 
   let docs=null;
+  const atlasPrefStarted=performance.now();
   try{
     docs=await atlasFetchCollectionRangeREST("preferences",startId,endId);
+    atlasDevDiag.preferences.route="REST";
+    atlasDevDiag.preferences.ms=Math.round(performance.now()-atlasPrefStarted);
+    atlasDevDiag.preferences.count=docs.length;
+    atlasDevDiag.preferences.ok++;
+    atlasDevDiag.preferences.error="";
+    atlasDiagPush("希望表","success",atlasDevDiag.preferences.ms,"preferencesRange-rest",docs.length+"件");
   }catch(restError){
+    atlasDevDiag.preferences.fail++;
+    atlasDevDiag.preferences.error=restError.message||String(restError);
     console.warn("希望表REST読取に失敗。Web SDKへフォールバックします:",restError);
     try{
       const queryPromise=preferencesCol()
@@ -3243,6 +3351,11 @@ async function loadPreferencesRange(dateStrs){
       const snap=await withPreferenceLongWait(queryPromise,"preferencesRange-sdk-fallback-timeout");
       docs=[];
       snap.forEach(doc=>docs.push({id:doc.id,data:doc.data()||{}}));
+      atlasDevDiag.preferences.route="SDK fallback";
+      atlasDevDiag.preferences.ms=Math.round(performance.now()-atlasPrefStarted);
+      atlasDevDiag.preferences.count=docs.length;
+      atlasDevDiag.preferences.fallback++;
+      atlasDiagPush("希望表","fallback-success",atlasDevDiag.preferences.ms,"preferencesRange-sdk-fallback",docs.length+"件");
     }catch(e){
       if(requestId !== preferencesLoadRequestId) return false;
       preferencesLoadState="error";
@@ -3363,9 +3476,18 @@ async function loadCalendarRange(dateStrs){
   const startId=sorted[0], endId=sorted[sorted.length-1];
   const wanted=new Set(dateStrs);
   let docs=null;
+  const atlasCalStarted=performance.now();
   try{
     docs=await atlasFetchCollectionRangeREST("calendar",startId,endId);
+    atlasDevDiag.calendar.route="REST";
+    atlasDevDiag.calendar.ms=Math.round(performance.now()-atlasCalStarted);
+    atlasDevDiag.calendar.count=docs.length;
+    atlasDevDiag.calendar.ok++;
+    atlasDevDiag.calendar.error="";
+    atlasDiagPush("カレンダー","success",atlasDevDiag.calendar.ms,"calendarRange-rest",docs.length+"件");
   }catch(restError){
+    atlasDevDiag.calendar.fail++;
+    atlasDevDiag.calendar.error=restError.message||String(restError);
     console.warn("カレンダーREST読取に失敗。Web SDKへフォールバックします:",restError);
     try{
       const snap=await withDbTimeout(
@@ -3377,6 +3499,11 @@ async function loadCalendarRange(dateStrs){
       );
       docs=[];
       snap.forEach(doc=>docs.push({id:doc.id,data:doc.data()||{}}));
+      atlasDevDiag.calendar.route="SDK fallback";
+      atlasDevDiag.calendar.ms=Math.round(performance.now()-atlasCalStarted);
+      atlasDevDiag.calendar.count=docs.length;
+      atlasDevDiag.calendar.fallback++;
+      atlasDiagPush("カレンダー","fallback-success",atlasDevDiag.calendar.ms,"calendarRange-sdk-fallback",docs.length+"件");
     }catch(e){
       return; // 従来仕様どおり、取得失敗時は既存表示を保持する。
     }
