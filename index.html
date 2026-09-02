@@ -1054,7 +1054,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-003-STARTUP-DIAGNOSTICS"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-004-DETAILED-BOOT-TIMELINE"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1173,18 +1173,27 @@ async function initFirebase(){
 
   try{
     setLoadingStep("Developer Beta Firebaseに接続中…");
+    atlasBootMark("initFirebase開始");
+    atlasBootMark("firebase.initializeApp開始");
     firebase.initializeApp(firebaseConfig);
+    atlasBootMark("firebase.initializeApp完了");
     if(RECAPTCHA_V3_SITE_KEY && RECAPTCHA_V3_SITE_KEY !== "YOUR_RECAPTCHA_V3_SITE_KEY"){
+      atlasBootMark("App Check activate開始");
       firebase.appCheck().activate(RECAPTCHA_V3_SITE_KEY, true);
+      atlasBootMark("App Check activate呼出完了");
     }
+    atlasBootMark("Firestoreインスタンス取得開始");
     db = firebase.firestore();
+    atlasBootMark("Firestoreインスタンス取得完了");
     // 学校・施設のWi-Fi/ファイアウォールなど一部のネットワークでは、Firestoreが
     // 標準で使う常時接続(WebChannelのストリーミング)がブロック・妨害され、
     // 特に書き込み用のWrite/channel接続だけが延々ペンディングのまま固まり、
     // 読み込みは通るのに書き込みだけ反映されない、という症状が起きることがある。
     // 通信方式を自動検出の長めポーリング(通常のHTTPリクエストの繰り返し)に
     // 切り替えることで、この種のネットワーク制限を回避しやすくする。
-    try{ db.settings({ experimentalAutoDetectLongPolling: true, merge: true }); }catch(e){ /* 失敗しても既定の接続方式で続行 */ }
+    atlasBootMark("Firestore settings開始");
+    try{ db.settings({ experimentalAutoDetectLongPolling: true, merge: true }); atlasBootMark("Firestore settings完了"); }
+    catch(e){ atlasBootMark("Firestore settings失敗", e.message||String(e)); }
     // enablePersistence（IndexedDBへのオフライン永続化）は意図的に無効化している。
     // SafariのIndexedDB実装には、初回アクセス時やバックグラウンド復帰時に
     // open()やトランザクションのPromiseが解決も失敗もせず永久にハングする
@@ -1197,15 +1206,24 @@ async function initFirebase(){
     // Authの既定の永続化(indexedDB)がiOS Safariでハングすることがあるため、
     // localStorageベースの永続化に切り替えてから匿名ログインする。
     // これ自体が失敗しても致命的ではないので握りつぶして続行する。
-    try{ await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL), 3000, "persistence-timeout"); }catch(e){ /* 失敗しても続行 */ }
+    atlasBootMark("Auth persistence開始");
+    try{
+      await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL), 3000, "persistence-timeout");
+      atlasBootMark("Auth persistence完了");
+    }catch(e){
+      atlasBootMark("Auth persistence失敗/継続", e.message||String(e));
+    }
     setLoadingStep("ログイン中…");
+    atlasBootMark("匿名Auth待機開始");
     await withTimeout(new Promise((resolve, reject)=>{
       firebase.auth().onAuthStateChanged(user=>{
         if(user){ resolve(); }
       }, reject);
       firebase.auth().signInAnonymously().catch(reject);
     }), 10000, "auth-timeout");
+    atlasBootMark("匿名Auth待機完了");
     firebaseReady = true;
+    atlasBootMark("initFirebase完了");
   }catch(e){
     firebaseReady = false;
     if(e && e.isTimeout){
@@ -3183,6 +3201,28 @@ function atlasDiagTime(ts){
   if(!ts) return "—";
   try{return new Date(ts).toLocaleTimeString("ja-JP",{hour12:false});}catch(e){return "—";}
 }
+const atlasBootTimeline = [];
+const atlasBootOrigin = (typeof performance!=="undefined" && performance.now) ? performance.now() : Date.now();
+function atlasBootNow(){
+  return ((typeof performance!=="undefined" && performance.now) ? performance.now() : Date.now()) - atlasBootOrigin;
+}
+function atlasBootMark(label, extra){
+  atlasBootTimeline.push({label, ms:Math.round(atlasBootNow()), extra:extra||""});
+  if(atlasBootTimeline.length>80) atlasBootTimeline.shift();
+}
+async function atlasBootMeasure(label, fn){
+  const s=atlasBootNow();
+  atlasBootMark(label+" 開始");
+  try{
+    const v=await fn();
+    atlasBootMark(label+" 完了", Math.round(atlasBootNow()-s)+"ms");
+    return v;
+  }catch(e){
+    atlasBootMark(label+" エラー", Math.round(atlasBootNow()-s)+"ms / "+(e&&e.message?e.message:String(e)));
+    throw e;
+  }
+}
+atlasBootMark("スクリプト実行開始");
 function atlasStartupRecord(route,label,ms,status,extra){
   atlasDevDiag.startup.reads.push({route,label,ms,status,at:Date.now(),extra:extra||""});
   if(atlasDevDiag.startup.reads.length>40) atlasDevDiag.startup.reads.shift();
@@ -3200,7 +3240,7 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.2 / Latest Mainline Source",
+    "環境: ATLAS REST BETA TEST 0.3 / Latest Mainline Source",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
@@ -3223,8 +3263,13 @@ function atlasDiagText(){
     "カレンダーREST成功/失敗: "+c.ok+"/"+c.fail+" / SDK fallback成功="+c.fallback,
     "カレンダーREST最終エラー: "+(c.error||"—"),
     "",
-    "[起動時読込]"
+    "[起動タイムライン]"
   ];
+  atlasBootTimeline.forEach(r=>{
+    rows.push("+"+r.ms+"ms "+r.label+(r.extra?" / "+r.extra:""));
+  });
+  rows.push("");
+  rows.push("[起動時読込]");
   atlasDevDiag.startup.reads.forEach(r=>rows.push(atlasDiagTime(r.at)+" "+r.route+" "+r.status+" "+r.ms+"ms "+r.label+(r.extra?" / "+r.extra:"")));
   rows.push("");
   rows.push("[直近REST/フォールバック処理]");
@@ -3256,7 +3301,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.2";
+const ATLAS_REST_MAINLINE_VERSION = "0.3";
 const REST_READ_TIMEOUT_MS = 12000;
 
 function atlasRestTimeout(promise, ms, label){
@@ -4513,7 +4558,9 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
   if(retryBtn) retryBtn.addEventListener("click", ()=> window.location.reload());
 
   const hideOverlayNow = ()=>{
+    atlasBootMark("ローディング解除実行");
     atlasMarkAppReady();
+    atlasBootMark("起動完了記録");
     const overlay = document.getElementById("appLoadingOverlay");
     if(overlay) overlay.classList.add("hide");
   };
@@ -4548,17 +4595,22 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
 
     (async ()=>{
       try{
+        atlasBootMark("attemptInit "+attempt+" 開始");
         setLoadingStep("Firebaseに接続中…" + attemptTag);
-        await initFirebase();
+        await atlasBootMeasure("Firebase初期化全体", ()=>initFirebase());
         if(settled) return;
+        atlasBootMark("connection banner設定開始");
         setupConnectionBanner();
+        atlasBootMark("connection banner設定完了");
         setLoadingStep("各種データを読み込み中…" + attemptTag);
-        await Promise.all([loadRoster(), loadSpecialDates(), loadAdminPassword(), loadRestorePasscode(), loadPrefDeadline()]);
+        await atlasBootMeasure("初期設定5系統読込", ()=>Promise.all([loadRoster(), loadSpecialDates(), loadAdminPassword(), loadRestorePasscode(), loadPrefDeadline()]));
         if(settled) return;
         setLoadingStep("画面を準備中…" + attemptTag);
-        await loadTab(currentTab);
+        await atlasBootMeasure("初期タブloadTab("+currentTab+")", ()=>loadTab(currentTab));
         if(settled) return;
+        atlasBootMark("最終render開始");
         render();
+        atlasBootMark("最終render完了");
       }catch(e){
         // 何が起きても読み込み中表示だけは残さないようにする
         // （ウォッチドッグと違い、こちらは「エラーで即終了」のケースなので
@@ -4578,6 +4630,7 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
       clearTimeout(watchdog);
       const elapsed = ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) - overlayShownAt;
       const remaining = Math.max(0, OVERLAY_MIN_MS - elapsed);
+      atlasBootMark("ローディング解除予約", "remaining="+Math.round(remaining)+"ms");
       setTimeout(hideOverlayNow, remaining);
     })();
   }
