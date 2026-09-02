@@ -731,6 +731,10 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   .dev-diag-pre{white-space:pre-wrap;word-break:break-word;background:#f3f4f6;border-radius:12px;padding:12px;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;}
   .dev-diag-actions{display:flex;gap:8px;margin-top:10px;}
   .dev-diag-actions button{flex:1;border:0;border-radius:10px;padding:10px;font-weight:800;cursor:pointer;}
+
+  .atlas-write-auth-badge{font-size:9px;font-weight:800;border-radius:999px;padding:3px 7px;background:#8a6d1d;color:#fff;white-space:nowrap}
+  .atlas-write-auth-badge.ready{background:#2e6f45}
+  .atlas-write-auth-badge.error{background:#a72b2b}
 </style>
   <!-- ATLAS stable v8: iOS 18.7.10 preference long-wait guard (single read / 30s) -->
   <!-- REST mainline experiment 0.1: preferences + calendar reads -->
@@ -763,7 +767,8 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · REST BOOT TEST 0.5</span>
+      <span class="rest-beta-env-badge">DEV BETA · REST AUTH TEST 0.6</span>
+      <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
@@ -1054,7 +1059,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-005-BOOT-REST"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-006-REST-AUTH"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1206,24 +1211,12 @@ async function initFirebase(){
     // Authの既定の永続化(indexedDB)がiOS Safariでハングすることがあるため、
     // localStorageベースの永続化に切り替えてから匿名ログインする。
     // これ自体が失敗しても致命的ではないので握りつぶして続行する。
-    atlasBootMark("Auth persistence開始", "NONE / beta experiment");
-    try{
-      await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.NONE), 1200, "persistence-timeout");
-      atlasBootMark("Auth persistence完了");
-    }catch(e){
-      atlasBootMark("Auth persistence失敗/継続", e.message||String(e));
-    }
-    setLoadingStep("ログイン中…");
-    atlasBootMark("匿名Auth待機開始");
-    await withTimeout(new Promise((resolve, reject)=>{
-      firebase.auth().onAuthStateChanged(user=>{
-        if(user){ resolve(); }
-      }, reject);
-      firebase.auth().signInAnonymously().catch(reject);
-    }), 10000, "auth-timeout");
-    atlasBootMark("匿名Auth待機完了");
-    firebaseReady = true;
-    atlasBootMark("initFirebase完了");
+    setLoadingStep("REST認証中…");
+    await atlasRestAuthRequest();
+    atlasBootMark("REST Auth起動経路完了");
+    firebaseReady=true;
+    atlasStartSdkAuthBackground();
+    atlasBootMark("initFirebase完了","REST read ready / SDK auth background");
   }catch(e){
     firebaseReady = false;
     if(e && e.isTimeout){
@@ -1525,6 +1518,7 @@ let unsubChecks = null;
 // のを防ぐために使う（各loadTab呼び出しは自分の世代番号を覚えておき、
 // 完了時に最新世代でなければ描画・購読をスキップする）。
 let loadTabGeneration = 0;
+const atlasTabLoadState={asa:"idle",hiru:"idle",yugata:"idle"};
 
 function isHistoryMode(){ return viewDate !== todayStr; }
 
@@ -1554,8 +1548,10 @@ function countStats(tab, checks){
 
 /* ---------- 初回ロード（構成データの取得・移行処理）---------- */
 async function ensureStructureLoaded(tab){
+  atlasTabLoadState[tab]="loading";
   if(!firebaseReady){
     structures[tab] = structures[tab] || withIds(INITIAL_DATA[tab].sections);
+    atlasTabLoadState[tab]="ready";
     return structures[tab];
   }
   try{
@@ -1566,10 +1562,12 @@ async function ensureStructureLoaded(tab){
         const reseeded = withIds(INITIAL_DATA[tab].sections);
         structures[tab] = reseeded;
         await saveStructure(tab);
+        atlasTabLoadState[tab]="ready";
         return reseeded;
       }
       structures[tab] = loaded;
-      if(tab==="hiru"){ await applyHiruContentFixV2(); }
+      atlasTabLoadState[tab]="ready";
+      if(tab==="hiru"){ applyHiruContentFixV2().catch(()=>{}); }
       return structures[tab];
     }
     // ここに来るのは REST で文書が存在しなかった場合のみ（＝そのタブがまだ一度も
@@ -1577,6 +1575,7 @@ async function ensureStructureLoaded(tab){
     const seeded = withIds(INITIAL_DATA[tab].sections);
     structures[tab] = seeded;
     await saveStructure(tab);
+    atlasTabLoadState[tab]="ready";
     return seeded;
   }catch(e){
     // 【重要】取得(get)自体が失敗/タイムアウトした場合は、絶対に初期データで
@@ -1586,6 +1585,7 @@ async function ensureStructureLoaded(tab){
     // 「保存はせず」表示だけ初期データにして、次に正常に読めた時に
     // 正しいデータへ復旧できるようにする。
     connErrFail("栽培管理データの取得", e);
+    atlasTabLoadState[tab]="error";
     if(structures[tab]) return structures[tab];
     return withIds(INITIAL_DATA[tab].sections);
   }
@@ -1907,10 +1907,10 @@ async function loadTab(tab){
 
   pruneOldChecks(tab); // 結果を待つ必要のない裏方処理（削除のみ）
   loadDateStats(tab).then(()=>{
-    if(myGen===loadTabGeneration && currentTab===tab) render();
+    if(myGen===loadTabGeneration && currentTab===tab && (hasStructureCache || atlasTabLoadState[tab]==="ready")) render();
   });
   loadViewDateAssignees(viewDate).then(()=>{
-    if(myGen===loadTabGeneration && currentTab===tab) render();
+    if(myGen===loadTabGeneration && currentTab===tab && (hasStructureCache || atlasTabLoadState[tab]==="ready")) render();
   });
 
   await essential;
@@ -2094,7 +2094,9 @@ function render(){
   if(sections.length===0){
     const note=document.createElement("div");
     note.className="empty-note";
-    note.textContent="まだ場所がありません。下の「＋ 新しい場所を追加」から作成してください";
+    note.textContent = atlasTabLoadState[currentTab]==="loading"
+      ? "場所データを読み込んでいます…"
+      : "まだ場所がありません。下の「＋ 新しい場所を追加」から作成してください";
     main.appendChild(note);
   }
 
@@ -2682,11 +2684,9 @@ let adminPasswordCurrent = ADMIN_PASSWORD;
 function adminAuthRef(){ return db.collection("duty_settings").doc("adminAuth"); }
 async function loadAdminPassword(){
   try{
-    const snap = await withDbTimeout(adminAuthRef().get(), "adminAuth-get-timeout");
-    if(snap.exists && typeof snap.data().password==="string" && snap.data().password){
-      adminPasswordCurrent = snap.data().password;
-    }
-  }catch(e){ /* オフライン時などは既定値のまま */ }
+    const doc=await atlasFetchDocumentREST("duty_settings","adminAuth");
+    if(doc.exists && typeof doc.data.password==="string" && doc.data.password) adminPasswordCurrent=doc.data.password;
+  }catch(e){}
 }
 async function changeAdminPassword(){
   const cur = prompt("現在の管理者パスワードを入力してください");
@@ -2729,11 +2729,9 @@ let restorePasscodeCurrent = RESTORE_PASSCODE_DEFAULT;
 function restoreAuthRef(){ return db.collection("duty_settings").doc("restoreAuth"); }
 async function loadRestorePasscode(){
   try{
-    const snap = await withDbTimeout(restoreAuthRef().get(), "restoreAuth-get-timeout");
-    if(snap.exists && typeof snap.data().passcode==="string" && /^\d{4}$/.test(snap.data().passcode)){
-      restorePasscodeCurrent = snap.data().passcode;
-    }
-  }catch(e){ /* オフライン時などは既定値のまま */ }
+    const doc=await atlasFetchDocumentREST("duty_settings","restoreAuth");
+    if(doc.exists && typeof doc.data.passcode==="string" && /^\d{4}$/.test(doc.data.passcode)) restorePasscodeCurrent=doc.data.passcode;
+  }catch(e){}
 }
 async function setRestorePasscode(newCode){
   try{
@@ -2836,13 +2834,9 @@ let roster = ROSTER_DEFAULT.slice();
 function rosterRef(){ return db.collection("duty_settings").doc("roster"); }
 async function loadRoster(){
   try{
-    const snap = await withDbTimeout(rosterRef().get(), "roster-get-timeout");
-    if(snap.exists && Array.isArray(snap.data().names) && snap.data().names.length){
-      roster = snap.data().names;
-    }else{
-      await withDbTimeout(rosterRef().set({ names: roster }), "roster-set-timeout");
-    }
-  }catch(e){ /* オフライン時などはデフォルトのまま */ }
+    const doc=await atlasFetchDocumentREST("duty_settings","roster");
+    if(doc.exists && Array.isArray(doc.data.names) && doc.data.names.length) roster=doc.data.names;
+  }catch(e){}
 }
 async function saveRoster(){
   try{ await rosterRef().set({ names: roster }); }catch(e){ toastFail("名簿の保存", e); }
@@ -3111,11 +3105,9 @@ let specialDates = {}; // { "YYYY-MM-DD": {custom:bool, points:number, label:str
 function specialDatesCol(){ return db.collection("special_dates"); }
 async function loadSpecialDates(){
   try{
-    const snap = await withDbTimeout(specialDatesCol().get(), "specialDates-get-timeout");
-    const map={};
-    snap.forEach(doc=>{ map[doc.id]=doc.data(); });
-    specialDates = map;
-  }catch(e){ /* 読み込み失敗時は空のまま */ }
+    const docs=await atlasFetchCollectionAllREST("special_dates");
+    const map={}; docs.forEach(doc=>{map[doc.id]=doc.data||{};}); specialDates=map;
+  }catch(e){}
 }
 function isDutyDate(dateStr){
   const d = new Date(dateStr+"T00:00:00");
@@ -3141,16 +3133,10 @@ let prefDeadline = null; // { date:"YYYY-MM-DD", time:"HH:MM"|null } | null(未�
 function prefDeadlineRef(){ return db.collection("duty_settings").doc("prefDeadline"); }
 async function loadPrefDeadline(){
   try{
-    const snap = await withDbTimeout(prefDeadlineRef().get(), "prefDeadline-get-timeout");
-    const loaded = (snap.exists && snap.data() && snap.data().date) ? { date: snap.data().date, time: snap.data().time || null } : null;
-    if(loaded && new Date(loaded.date + "T" + (loaded.time || "23:59") + ":00") <= new Date()){
-      // 締切を過ぎているものは自動解除(次に管理者が設定するまで常に受付中に戻す)
-      try{ await withDbTimeout(prefDeadlineRef().delete(), "prefDeadline-delete-timeout"); }catch(e){}
-      prefDeadline = null;
-    }else{
-      prefDeadline = loaded;
-    }
-  }catch(e){ /* オフライン時は既存キャッシュのまま */ }
+    const doc=await atlasFetchDocumentREST("duty_settings","prefDeadline");
+    const loaded=(doc.exists&&doc.data&&doc.data.date)?{date:doc.data.date,time:doc.data.time||null}:null;
+    prefDeadline=(loaded && new Date(loaded.date+"T"+(loaded.time||"23:59")+":00")<=new Date())?null:loaded;
+  }catch(e){}
 }
 async function savePrefDeadline(deadline){
   try{
@@ -3235,11 +3221,13 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.5 / Latest Mainline Source",
+    "環境: ATLAS REST BETA TEST 0.6 / Latest Mainline Source",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
-    "Firebase: "+(firebaseReady?"接続済み":"未接続"),
+        "Firebase: "+(firebaseReady?"接続済み":"未接続"),
+    "REST Auth: "+(atlasRestAuthReady?"準備済み":"未準備"),
+    "SDK書込Auth: "+(atlasSdkAuthReady?"準備済み":(atlasSdkAuthError?"エラー: "+atlasSdkAuthError:"準備中")),
     "Safari: "+safari+" / WebKit: "+webkit,
     "",
     "起動完了まで: "+(atlasDevDiag.startup.totalMs==null?"計測中":atlasDevDiag.startup.totalMs+"ms"),
@@ -3279,6 +3267,14 @@ function renderAtlasDevDiag(){
   const el=document.getElementById("devDiagBody");
   if(el) el.textContent=atlasDiagText();
 }
+function updateAtlasWriteAuthBadge(){
+  const el=document.getElementById("atlasWriteAuthBadge");
+  if(!el) return;
+  el.classList.remove("ready","error");
+  if(atlasSdkAuthReady){el.textContent="書込認証OK";el.classList.add("ready");}
+  else if(atlasSdkAuthError){el.textContent="書込認証エラー";el.classList.add("error");}
+  else el.textContent="書込認証準備中";
+}
 function initAtlasDevDiagUI(){
   const btn=document.getElementById("devDiagBtn");
   const modal=document.getElementById("devDiagModal");
@@ -3296,8 +3292,86 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.5";
+const ATLAS_REST_MAINLINE_VERSION = "0.6";
 const REST_READ_TIMEOUT_MS = 12000;
+let atlasRestIdToken="";
+let atlasRestRefreshToken="";
+let atlasRestAuthReady=false;
+let atlasSdkAuthReady=false;
+let atlasSdkAuthError="";
+const ATLAS_REST_REFRESH_KEY="atlasDevRestRefreshToken";
+
+async function atlasRestAuthRequest(){
+  const started=performance.now();
+  atlasBootMark("REST Auth開始");
+  const saved=localStorage.getItem(ATLAS_REST_REFRESH_KEY)||"";
+  if(saved){
+    try{
+      atlasBootMark("REST Auth refresh開始");
+      const res=await fetch(`https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(firebaseConfig.apiKey)}`,{
+        method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+        body:"grant_type=refresh_token&refresh_token="+encodeURIComponent(saved),cache:"no-store"
+      });
+      const raw=await res.text();
+      if(!res.ok) throw new Error(`REST Auth refresh HTTP ${res.status}: ${raw.slice(0,250)}`);
+      const data=JSON.parse(raw);
+      atlasRestIdToken=data.id_token||"";
+      atlasRestRefreshToken=data.refresh_token||saved;
+      if(!atlasRestIdToken) throw new Error("REST Auth refresh: ID token missing");
+      localStorage.setItem(ATLAS_REST_REFRESH_KEY,atlasRestRefreshToken);
+      atlasRestAuthReady=true;
+      atlasBootMark("REST Auth refresh完了",Math.round(performance.now()-started)+"ms");
+      return true;
+    }catch(e){
+      atlasBootMark("REST Auth refresh失敗",e.message||String(e));
+      localStorage.removeItem(ATLAS_REST_REFRESH_KEY);
+    }
+  }
+  atlasBootMark("REST Auth anonymous sign-up開始");
+  const res=await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${encodeURIComponent(firebaseConfig.apiKey)}`,{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({returnSecureToken:true}),cache:"no-store"
+  });
+  const raw=await res.text();
+  if(!res.ok) throw new Error(`REST Auth signUp HTTP ${res.status}: ${raw.slice(0,250)}`);
+  const data=JSON.parse(raw);
+  atlasRestIdToken=data.idToken||"";
+  atlasRestRefreshToken=data.refreshToken||"";
+  if(!atlasRestIdToken) throw new Error("REST Auth signUp: ID token missing");
+  if(atlasRestRefreshToken) localStorage.setItem(ATLAS_REST_REFRESH_KEY,atlasRestRefreshToken);
+  atlasRestAuthReady=true;
+  atlasBootMark("REST Auth anonymous sign-up完了",Math.round(performance.now()-started)+"ms");
+  return true;
+}
+
+async function atlasStartSdkAuthBackground(){
+  atlasBootMark("SDK Authバックグラウンド開始");
+  try{
+    try{
+      await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.NONE),1200,"sdk-persistence-bg-timeout");
+      atlasBootMark("SDK Auth persistence完了");
+    }catch(e){
+      atlasBootMark("SDK Auth persistence失敗/継続",e.message||String(e));
+    }
+    await withTimeout(new Promise((resolve,reject)=>{
+      const cur=firebase.auth().currentUser;
+      if(cur){resolve(cur);return;}
+      let unsub=null;
+      unsub=firebase.auth().onAuthStateChanged(user=>{if(user){if(unsub)unsub();resolve(user);}},reject);
+      firebase.auth().signInAnonymously().catch(reject);
+    }),12000,"sdk-auth-bg-timeout");
+    atlasSdkAuthReady=true;
+    firebaseReady=true;
+    atlasBootMark("SDK Authバックグラウンド完了");
+    updateAtlasWriteAuthBadge();
+    try{subscribeStructure(currentTab);subscribeChecks(currentTab);}catch(e){}
+  }catch(e){
+    atlasSdkAuthError=e.message||String(e);
+    atlasBootMark("SDK Authバックグラウンド失敗",atlasSdkAuthError);
+    updateAtlasWriteAuthBadge();
+  }
+}
+
 
 function atlasRestTimeout(promise, ms, label){
   let timer;
@@ -3309,8 +3383,9 @@ function atlasRestTimeout(promise, ms, label){
   ]).finally(()=>clearTimeout(timer));
 }
 async function atlasRestAuthHeaders(){
+  if(atlasRestIdToken) return {"Authorization":"Bearer "+atlasRestIdToken,"Content-Type":"application/json"};
   const user=firebase.auth().currentUser;
-  if(!user) throw new Error("Firebase Auth user unavailable");
+  if(!user) throw new Error("REST/Auth token unavailable");
   const idToken=await atlasRestTimeout(user.getIdToken(false),10000,"rest-id-token");
   return {"Authorization":"Bearer "+idToken,"Content-Type":"application/json"};
 }
@@ -3372,6 +3447,26 @@ async function atlasFetchCollectionRangeREST(collection,startId,endId){
   }finally{ clearTimeout(timer); }
 }
 
+
+async function atlasFetchCollectionAllREST(collection){
+  const started=performance.now();
+  const headers=await atlasRestAuthHeaders();
+  const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:runQuery`;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),REST_READ_TIMEOUT_MS);
+  try{
+    const res=await fetch(url,{method:"POST",headers,body:JSON.stringify({structuredQuery:{from:[{collectionId:collection}]}}),signal:controller.signal,cache:"no-store"});
+    const raw=await res.text();
+    if(!res.ok) throw new Error(`REST HTTP ${res.status}: ${raw.slice(0,450)}`);
+    const rows=raw?JSON.parse(raw):[];
+    const docs=[];
+    (Array.isArray(rows)?rows:[]).forEach(row=>{
+      if(row&&row.document&&row.document.name) docs.push({id:row.document.name.split("/").pop(),data:atlasDecodeFirestoreDocument(row.document)});
+    });
+    if(!atlasDevDiag.startup.readyAt) atlasStartupRecord("REST",collection+"All-rest",Math.round(performance.now()-started),"success",docs.length+"件");
+    return docs;
+  }finally{clearTimeout(timer);}
+}
 
 async function atlasFetchDocumentREST(collection,id){
   const started=performance.now();
