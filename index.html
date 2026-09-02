@@ -767,7 +767,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · REST AUTH TEST 0.6</span>
+      <span class="rest-beta-env-badge">DEV BETA · REST AUTH TEST 0.7</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
@@ -1059,7 +1059,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-006-REST-AUTH"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-007-WRITE-GUARD-RTSYNC"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1612,6 +1612,7 @@ async function applyHiruContentFixV2(){
 
 /* ---------- 保存（自動保存） ---------- */
 async function saveStructure(tab){
+  if(!atlasRequireSdkWriteAuth("栽培構成の保存")) return false;
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   try{
     await withDbTimeout(structureRef(tab).set({
@@ -1624,6 +1625,7 @@ async function saveStructure(tab){
   }
 }
 async function transactStructure(tab, mutateFn){
+  if(!atlasRequireSdkWriteAuth("栽培構成の編集")) return false;
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   for(let attempt=1; attempt<=2; attempt++){
     try{
@@ -1650,6 +1652,7 @@ async function transactStructure(tab, mutateFn){
   }
 }
 async function saveChecks(tab){
+  if(!atlasRequireSdkWriteAuth("チェック状態の保存")) return false;
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   const stats = countStats(tab, todayChecked);
   dateStats[todayStr] = stats;
@@ -1675,6 +1678,7 @@ async function saveChecks(tab){
 function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
 
   async function transactChecks(tab, mutateFn){
+  if(!atlasRequireSdkWriteAuth("チェック操作")) return false;
   if(!firebaseReady){ showConfigWarningOnce(); return; }
   // 起動直後など、端末の通信/IndexedDBがまだ本調子でないタイミングでは
   // このトランザクションが単発で失敗することがある。少し間をおいて
@@ -1793,7 +1797,11 @@ function unsubscribeAll(){
   if(unsubChecks){ unsubChecks(); unsubChecks=null; }
 }
 function subscribeStructure(tab){
-  if(!firebaseReady) return;
+  if(!firebaseReady || !atlasSdkAuthReady || !firebase.auth().currentUser){
+    atlasBootMark("structure購読保留",tab+" / SDK Auth未準備");
+    return;
+  }
+  if(unsubStructure){ try{unsubStructure();}catch(e){} unsubStructure=null; }
   unsubStructure = structureRef(tab).onSnapshot((snap)=>{
     if(snap.metadata.hasPendingWrites) return; // 自分自身の書き込みは無視（二重再描画防止）
     if(snap.exists && snap.data() && snap.data().sections){
@@ -1801,11 +1809,19 @@ function subscribeStructure(tab){
       if(tab===currentTab){ render(); updateUndoBtn(); }
     }
   }, (err)=>{
+    if(!atlasSdkAuthReady || !firebase.auth().currentUser){
+      atlasBootMark("structure購読エラー抑止",err&&err.message?err.message:String(err));
+      return;
+    }
     flashConnError("リアルタイム同期でエラーが発生しました");
   });
 }
 function subscribeChecks(tab){
-  if(!firebaseReady) return;
+  if(!firebaseReady || !atlasSdkAuthReady || !firebase.auth().currentUser){
+    atlasBootMark("checks購読保留",tab+" / SDK Auth未準備");
+    return;
+  }
+  if(unsubChecks){ try{unsubChecks();}catch(e){} unsubChecks=null; }
   unsubChecks = checksRef(tab, todayStr).onSnapshot((snap)=>{
     if(snap.metadata.hasPendingWrites) return;
     todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
@@ -1816,6 +1832,10 @@ function subscribeChecks(tab){
       render();
     }
   }, (err)=>{
+    if(!atlasSdkAuthReady || !firebase.auth().currentUser){
+      atlasBootMark("checks購読エラー抑止",err&&err.message?err.message:String(err));
+      return;
+    }
     flashConnError("リアルタイム同期でエラーが発生しました");
   });
 }
@@ -1919,8 +1939,12 @@ async function loadTab(tab){
   if(myGen !== loadTabGeneration || currentTab!==tab) return;
 
   checkedMap = todayChecked;
-  subscribeStructure(tab);
-  subscribeChecks(tab);
+  if(atlasSdkAuthReady && firebase.auth().currentUser){
+    subscribeStructure(tab);
+    subscribeChecks(tab);
+  }else{
+    atlasBootMark("loadTab購読待機",tab+" / SDK Authバックグラウンド中");
+  }
   updateUndoBtn();
   render();
 }
@@ -2689,6 +2713,7 @@ async function loadAdminPassword(){
   }catch(e){}
 }
 async function changeAdminPassword(){
+  if(!atlasRequireSdkWriteAuth("管理者パスワードの変更")) return false;
   const cur = prompt("現在の管理者パスワードを入力してください");
   if(cur===null) return;
   if(cur!==adminPasswordCurrent){ showToast("現在のパスワードが違います"); return; }
@@ -2734,6 +2759,7 @@ async function loadRestorePasscode(){
   }catch(e){}
 }
 async function setRestorePasscode(newCode){
+  if(!atlasRequireSdkWriteAuth("復元用パスコードの変更")) return false;
   try{
     await restoreAuthRef().set({ passcode: newCode });
     restorePasscodeCurrent = newCode;
@@ -2839,6 +2865,7 @@ async function loadRoster(){
   }catch(e){}
 }
 async function saveRoster(){
+  if(!atlasRequireSdkWriteAuth("名簿の保存")) return false;
   try{ await rosterRef().set({ names: roster }); }catch(e){ toastFail("名簿の保存", e); }
 }
 function openRosterModal(){
@@ -3139,6 +3166,7 @@ async function loadPrefDeadline(){
   }catch(e){}
 }
 async function savePrefDeadline(deadline){
+  if(!atlasRequireSdkWriteAuth("希望表締切の保存")) return false;
   try{
     if(deadline) await prefDeadlineRef().set({ date: deadline.date, time: deadline.time || null });
     else await prefDeadlineRef().delete();
@@ -3221,13 +3249,14 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.6 / Latest Mainline Source",
+    "環境: ATLAS REST BETA TEST 0.7 / Latest Mainline Source",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
         "Firebase: "+(firebaseReady?"接続済み":"未接続"),
     "REST Auth: "+(atlasRestAuthReady?"準備済み":"未準備"),
     "SDK書込Auth: "+(atlasSdkAuthReady?"準備済み":(atlasSdkAuthError?"エラー: "+atlasSdkAuthError:"準備中")),
+    "リアルタイム購読: "+(atlasSdkAuthReady?"SDK Auth後に有効":"Auth待機中（購読保留）"),
     "Safari: "+safari+" / WebKit: "+webkit,
     "",
     "起動完了まで: "+(atlasDevDiag.startup.totalMs==null?"計測中":atlasDevDiag.startup.totalMs+"ms"),
@@ -3267,6 +3296,14 @@ function renderAtlasDevDiag(){
   const el=document.getElementById("devDiagBody");
   if(el) el.textContent=atlasDiagText();
 }
+function atlasRequireSdkWriteAuth(actionLabel){
+  if(atlasSdkAuthReady && firebase.auth().currentUser) return true;
+  const msg=(actionLabel||"保存")+"は書込認証の準備完了後に利用できます";
+  if(typeof showToast==="function") showToast("書込認証を準備中です。数秒後に再試行してください");
+  atlasBootMark("書込ガード",msg);
+  return false;
+}
+
 function updateAtlasWriteAuthBadge(){
   const el=document.getElementById("atlasWriteAuthBadge");
   if(!el) return;
@@ -3292,7 +3329,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.6";
+const ATLAS_REST_MAINLINE_VERSION = "0.7";
 const REST_READ_TIMEOUT_MS = 12000;
 let atlasRestIdToken="";
 let atlasRestRefreshToken="";
@@ -3364,7 +3401,14 @@ async function atlasStartSdkAuthBackground(){
     firebaseReady=true;
     atlasBootMark("SDK Authバックグラウンド完了");
     updateAtlasWriteAuthBadge();
-    try{subscribeStructure(currentTab);subscribeChecks(currentTab);}catch(e){}
+    try{
+      unsubscribeAll();
+      subscribeStructure(currentTab);
+      subscribeChecks(currentTab);
+      atlasBootMark("リアルタイム購読開始",currentTab);
+    }catch(e){
+      atlasBootMark("リアルタイム購読開始失敗",e&&e.message?e.message:String(e));
+    }
   }catch(e){
     atlasSdkAuthError=e.message||String(e);
     atlasBootMark("SDK Authバックグラウンド失敗",atlasSdkAuthError);
