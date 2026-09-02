@@ -763,7 +763,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · REST TEST</span>
+      <span class="rest-beta-env-badge">DEV BETA · REST BOOT TEST 0.5</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
@@ -1054,7 +1054,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-004-DETAILED-BOOT-TIMELINE"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-005-BOOT-REST"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1206,9 +1206,9 @@ async function initFirebase(){
     // Authの既定の永続化(indexedDB)がiOS Safariでハングすることがあるため、
     // localStorageベースの永続化に切り替えてから匿名ログインする。
     // これ自体が失敗しても致命的ではないので握りつぶして続行する。
-    atlasBootMark("Auth persistence開始");
+    atlasBootMark("Auth persistence開始", "NONE / beta experiment");
     try{
-      await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL), 3000, "persistence-timeout");
+      await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.NONE), 1200, "persistence-timeout");
       atlasBootMark("Auth persistence完了");
     }catch(e){
       atlasBootMark("Auth persistence失敗/継続", e.message||String(e));
@@ -1559,9 +1559,9 @@ async function ensureStructureLoaded(tab){
     return structures[tab];
   }
   try{
-    const snap = await withDbTimeoutRetry(()=>structureRef(tab).get(), "structure-get-timeout");
-    if(snap.exists && snap.data() && snap.data().sections){
-      let loaded = snap.data().sections;
+    const restDoc = await atlasFetchDocumentREST("structures", tab);
+    if(restDoc.exists && restDoc.data && restDoc.data.sections){
+      let loaded = restDoc.data.sections;
       if(isPlaceholderStructure(loaded)){
         const reseeded = withIds(INITIAL_DATA[tab].sections);
         structures[tab] = reseeded;
@@ -1572,7 +1572,7 @@ async function ensureStructureLoaded(tab){
       if(tab==="hiru"){ await applyHiruContentFixV2(); }
       return structures[tab];
     }
-    // ここに来るのは snap.exists===false の場合のみ（＝そのタブがまだ一度も
+    // ここに来るのは REST で文書が存在しなかった場合のみ（＝そのタブがまだ一度も
     // 作成されていない、本当の初回起動）。この場合だけ初期データを書き込む。
     const seeded = withIds(INITIAL_DATA[tab].sections);
     structures[tab] = seeded;
@@ -1740,13 +1740,10 @@ async function loadDateStats(tab){
   const days = getLastNDays(HISTORY_DAYS);
   const oldest = days[days.length-1];
   try{
-    const q = await withDbTimeout(db.collection("checks")
-      .where(firebase.firestore.FieldPath.documentId(), ">=", tab+"_"+oldest)
-      .where(firebase.firestore.FieldPath.documentId(), "<=", tab+"_"+todayStr)
-      .get(), "dateStats-get-timeout");
-    q.docs.forEach(doc=>{
+    const docs = await atlasFetchCollectionRangeREST("checks", tab+"_"+oldest, tab+"_"+todayStr);
+    docs.forEach(doc=>{
       const day = doc.id.slice(tab.length+1);
-      const data = doc.data();
+      const data = doc.data || {};
       dateStats[day] = data.stats || countStats(tab, data.data || {});
     });
   }catch(e){ /* 履歴統計の取得失敗は致命的でないため無視 */ }
@@ -1756,11 +1753,9 @@ async function pruneOldChecks(tab){
   const days = getLastNDays(HISTORY_DAYS);
   const oldestKept = days[days.length-1];
   try{
-    const q = await withDbTimeout(db.collection("checks")
-      .where(firebase.firestore.FieldPath.documentId(), ">=", tab+"_")
-      .where(firebase.firestore.FieldPath.documentId(), "<", tab+"_"+oldestKept)
-      .get(), "pruneChecks-get-timeout");
-    for(const d of q.docs){ await withDbTimeout(d.ref.delete(), "pruneChecks-delete-timeout"); }
+    const docs = await atlasFetchCollectionRangeREST("checks", tab+"_", tab+"_"+oldestKept);
+    const oldDocs = docs.filter(d=>d.id < tab+"_"+oldestKept);
+    for(const d of oldDocs){ await withDbTimeout(db.collection("checks").doc(d.id).delete(), "pruneChecks-delete-timeout"); }
   }catch(e){ /* 整理失敗は無視 */ }
 }
 
@@ -1772,8 +1767,8 @@ async function loadTodayChecks(tab){
     return;
   }
   try{
-    const snap = await withDbTimeoutRetry(()=>checksRef(tab, todayStr).get(), "todayChecks-get-timeout");
-    todayChecked = (snap.exists && snap.data() && snap.data().data) ? snap.data().data : {};
+    const restDoc = await atlasFetchDocumentREST("checks", tab+"_"+todayStr);
+    todayChecked = (restDoc.exists && restDoc.data && restDoc.data.data) ? restDoc.data.data : {};
     todayCheckedCache[tab] = todayChecked;
   }catch(e){
     // 取得に失敗しても、以前取得済みの状態があれば消さずに表示を維持する。
@@ -1934,8 +1929,8 @@ async function loadTab(tab){
 async function loadViewDateAssignees(day){
   if(!firebaseReady){ viewDateAssignees = []; return; }
   try{
-    const snap = await withDbTimeout(calendarCol().doc(day).get(), "viewDateAssignees-get-timeout");
-    viewDateAssignees = (snap.exists && Array.isArray(snap.data().people)) ? snap.data().people : [];
+    const restDoc = await atlasFetchDocumentREST("calendar", day);
+    viewDateAssignees = (restDoc.exists && Array.isArray(restDoc.data.people)) ? restDoc.data.people : [];
   }catch(e){ viewDateAssignees = []; }
 }
 
@@ -3240,7 +3235,7 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.3 / Latest Mainline Source",
+    "環境: ATLAS REST BETA TEST 0.5 / Latest Mainline Source",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
@@ -3301,7 +3296,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.3";
+const ATLAS_REST_MAINLINE_VERSION = "0.5";
 const REST_READ_TIMEOUT_MS = 12000;
 
 function atlasRestTimeout(promise, ms, label){
@@ -3374,6 +3369,28 @@ async function atlasFetchCollectionRangeREST(collection,startId,endId){
     });
     if(!atlasDevDiag.startup.readyAt) atlasStartupRecord("REST",collection+"Range-rest",Math.round(performance.now()-atlasRestStarted),"success",docs.length+"件");
     return docs;
+  }finally{ clearTimeout(timer); }
+}
+
+
+async function atlasFetchDocumentREST(collection,id){
+  const started=performance.now();
+  const headers=await atlasRestAuthHeaders();
+  const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}/${encodeURIComponent(id)}`;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),REST_READ_TIMEOUT_MS);
+  try{
+    const res=await fetch(url,{method:"GET",headers,signal:controller.signal,cache:"no-store"});
+    if(res.status===404){
+      if(!atlasDevDiag.startup.readyAt) atlasStartupRecord("REST",collection+"/"+id,Math.round(performance.now()-started),"success","not-found");
+      return {exists:false,id,data:{}};
+    }
+    const raw=await res.text();
+    if(!res.ok) throw new Error(`REST HTTP ${res.status}: ${raw.slice(0,450)}`);
+    const doc=raw?JSON.parse(raw):{};
+    const result={exists:true,id,data:atlasDecodeFirestoreDocument(doc)};
+    if(!atlasDevDiag.startup.readyAt) atlasStartupRecord("REST",collection+"/"+id,Math.round(performance.now()-started),"success","1件");
+    return result;
   }finally{ clearTimeout(timer); }
 }
 
