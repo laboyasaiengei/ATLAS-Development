@@ -749,44 +749,46 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
 <!-- REST experiment: latest mainline source + Developer Beta Firebase ONLY -->
 
 <style>
-/* 0.11.2 exact header placement */
-.brand-row{align-items:flex-start !important;}
-.brand-right-stack{
-  margin-left:auto;
+/* 0.11.3: mode-switch is intentionally untouched.
+   Only date/night-mode are lifted and compact status occupies the space directly below them. */
+.date-status-stack{
   display:flex;
   flex-direction:column;
-  align-items:stretch;
+  align-items:flex-end;
   gap:3px;
-  flex:0 1 auto;
-  min-width:0;
+  align-self:flex-start;
+  margin-top:-3px;
 }
-.brand-right-stack .brand-controls{
-  margin-left:0 !important;
-  align-self:flex-end;
+.date-theme-row{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:8px;
 }
-.brand-right-stack .mode-switch{
+#connBanner.compact-status{
+  display:flex !important;
+  width:auto !important;
+  max-width:150px;
   margin:0 !important;
-  width:100%;
-  min-width:180px;
+  padding:2px 6px !important;
+  border-radius:7px !important;
+  font-size:9.5px !important;
+  line-height:1.15 !important;
+  min-height:0 !important;
+  white-space:nowrap;
 }
-.brand-right-stack .mode-switch button{
-  padding:5px 6px;
-  font-size:11.5px;
-}
-.brand-right-stack #connBanner{
-  margin:0 !important;
-  padding:3px 7px !important;
-  min-height:0;
-  font-size:10px !important;
-  line-height:1.2;
-  width:auto;
+#connBanner.compact-status .conn-dot{
+  width:5px !important;
+  height:5px !important;
 }
 @media (max-width:520px){
-  .brand-row{gap:6px;}
-  .brand-right-stack{max-width:58vw;}
-  .brand-right-stack .mode-switch{min-width:0;}
-  .brand-right-stack .mode-switch button{font-size:10.5px;padding:4px 4px;}
-  .brand-right-stack #connBanner{font-size:9.5px !important;}
+  .date-status-stack{gap:2px;margin-top:-2px;}
+  .date-theme-row{gap:5px;}
+  #connBanner.compact-status{
+    max-width:125px;
+    padding:2px 5px !important;
+    font-size:8.8px !important;
+  }
 }
 </style>
 
@@ -817,20 +819,22 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
         <div class="brand-sub">Agricultural Task and Labor Administration System</div>
       </div>
     </div>
-    <div class="brand-right-stack">
-      <div class="brand-controls">
-        <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10.2</span>
-        <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
-        <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
-        <span class="date-pill" id="datePill">–</span>
-        <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
+    <div class="brand-controls">
+      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10.2</span>
+      <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
+      <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
+      <div class="date-status-stack">
+        <div class="date-theme-row">
+          <span class="date-pill" id="datePill">–</span>
+          <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
+        </div>
+        <div class="conn-banner compact-status" id="connBanner"><span class="conn-dot"></span><span id="connBannerText">同期中</span></div>
       </div>
-      <div class="mode-switch" id="modeSwitch">
-        <button data-mode="check" class="active">✅ 栽培管理</button>
-        <button data-mode="duty">📅 当番管理</button>
-      </div>
-      <div class="conn-banner" id="connBanner"><span class="conn-dot"></span><span id="connBannerText">同期中…</span></div>
     </div>
+  </div>
+  <div class="mode-switch" id="modeSwitch">
+    <button data-mode="check" class="active">✅ 栽培管理</button>
+    <button data-mode="duty">📅 当番管理</button>
   </div>
 
   <div id="checkModeHeader">
@@ -1311,13 +1315,13 @@ function setAtlasConnState(state, detail){
   if(!banner || !text) return;
   banner.dataset.state = state;
   if(state==="ok"){
-    text.textContent = "接続済み・最終同期 " + atlasFormatSyncTime(atlasLastSyncSuccessAt);
+    text.textContent = "接続済 " + atlasFormatSyncTime(atlasLastSyncSuccessAt);
   }else if(state==="syncing"){
-    text.textContent = detail || "同期中…";
+    text.textContent = "同期中";
   }else if(state==="offline"){
-    text.textContent = "オフライン・再接続待ち";
+    text.textContent = "オフライン";
   }else{
-    text.textContent = detail || "同期エラー・自動再試行中";
+    text.textContent = "同期エラー";
   }
   banner.classList.add("show");
 }
@@ -3357,7 +3361,7 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.11.2 / HEADER FIX",
+    "環境: ATLAS REST BETA TEST 0.11.3 / STATUS POSITION FIX",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
