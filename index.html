@@ -183,13 +183,21 @@
 
   /* ---- 接続状態バナー ---- */
   .conn-banner{
-    display:none; align-items:center; gap:8px;
-    font-size:11.5px; color:#ffe6d6; background:rgba(193,97,63,.22);
-    border:1px solid rgba(193,97,63,.4); border-radius:10px;
-    padding:7px 10px; margin-top:10px;
+    display:flex; align-items:center; gap:8px;
+    font-size:11.5px; color:var(--soil-700); background:rgba(255,255,255,.55);
+    border:1px solid var(--line); border-radius:10px;
+    padding:6px 10px; margin-top:8px;
   }
   .conn-banner.show{display:flex;}
-  .conn-dot{width:7px; height:7px; border-radius:50%; background:var(--alert); flex:0 0 auto;}
+  .conn-banner[data-state="ok"]{color:var(--leaf-600); background:rgba(238,244,236,.72); border-color:#cfe4c9;}
+  .conn-banner[data-state="syncing"]{color:var(--soil-700);}
+  .conn-banner[data-state="offline"],
+  .conn-banner[data-state="error"]{color:#8a3d26; background:rgba(193,97,63,.12); border-color:rgba(193,97,63,.35);}
+  .conn-dot{width:7px; height:7px; border-radius:50%; background:#999; flex:0 0 auto;}
+  .conn-banner[data-state="ok"] .conn-dot{background:var(--leaf-600);}
+  .conn-banner[data-state="syncing"] .conn-dot{background:#9a7b45;}
+  .conn-banner[data-state="offline"] .conn-dot,
+  .conn-banner[data-state="error"] .conn-dot{background:var(--alert);}
 
   main{padding:12px 16px 16px; max-width:640px; margin:0 auto;}
 
@@ -739,6 +747,38 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
   <!-- ATLAS stable v8: iOS 18.7.10 preference long-wait guard (single read / 30s) -->
   <!-- REST mainline experiment 0.1: preferences + calendar reads -->
 <!-- REST experiment: latest mainline source + Developer Beta Firebase ONLY -->
+
+<style>
+/* ATLAS REST BETA 0.11.1 — header compact layout */
+@media (min-width: 0px){
+  header .header-top,
+  .header-top{
+    align-items:flex-start !important;
+  }
+
+  /* Date / mode control group: lift toward title row */
+  header .header-actions,
+  header .top-actions,
+  header .header-controls,
+  .header-actions,
+  .top-actions,
+  .header-controls{
+    align-self:flex-start !important;
+    margin-top:0 !important;
+    transform:translateY(-2px);
+  }
+
+  /* Connection state sits below the date/mode controls, not as a full-width extra row */
+  #connBanner{
+    margin-top:4px !important;
+    padding:4px 8px !important;
+    min-height:0 !important;
+    line-height:1.25 !important;
+    font-size:10.5px !important;
+  }
+}
+</style>
+
 </head>
 <body>
 
@@ -1241,29 +1281,56 @@ function showConfigBanner(){
   main.appendChild(banner);
 }
 
-/* ---------- 接続状態バナー ---------- */
+/* ---------- 接続・同期状態（簡素表示） ---------- */
+let atlasLastSyncSuccessAt = 0;
+let atlasConnState = "syncing";
+
+function atlasFormatSyncTime(ts){
+  if(!ts) return "—";
+  try{
+    return new Date(ts).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  }catch(_){ return "—"; }
+}
+function setAtlasConnState(state, detail){
+  atlasConnState = state;
+  const banner = document.getElementById("connBanner");
+  const text = document.getElementById("connBannerText");
+  if(!banner || !text) return;
+  banner.dataset.state = state;
+  if(state==="ok"){
+    text.textContent = "接続済み・最終同期 " + atlasFormatSyncTime(atlasLastSyncSuccessAt);
+  }else if(state==="syncing"){
+    text.textContent = detail || "同期中…";
+  }else if(state==="offline"){
+    text.textContent = "オフライン・再接続待ち";
+  }else{
+    text.textContent = detail || "同期エラー・自動再試行中";
+  }
+  banner.classList.add("show");
+}
+function atlasMarkSyncSuccess(){
+  atlasLastSyncSuccessAt = Date.now();
+  setAtlasConnState("ok");
+}
 function setupConnectionBanner(){
-  updateConnBanner();
-  window.addEventListener("online", updateConnBanner);
-  window.addEventListener("offline", updateConnBanner);
+  setAtlasConnState(navigator.onLine ? "syncing" : "offline");
+  window.addEventListener("online", ()=>{
+    setAtlasConnState("syncing","再接続中…");
+    if(atlasRestPollTab) atlasScheduleRestPoll(0);
+  });
+  window.addEventListener("offline", ()=>{
+    setAtlasConnState("offline");
+    atlasRestPollFailureCount = Math.max(atlasRestPollFailureCount,1);
+    atlasScheduleRestPoll(ATLAS_REST_BACKOFF_MS[Math.min(atlasRestPollFailureCount,ATLAS_REST_BACKOFF_MS.length-1)]);
+  });
 }
 function updateConnBanner(){
-  const banner = document.getElementById("connBanner");
-  const text = document.getElementById("connBannerText");
-  if(!navigator.onLine){
-    text.textContent = "オフラインです。通信が回復すると自動的に同期されます";
-    banner.classList.add("show");
-  }else{
-    banner.classList.remove("show");
-  }
+  if(!navigator.onLine) setAtlasConnState("offline");
+  else if(atlasLastSyncSuccessAt) setAtlasConnState("ok");
+  else setAtlasConnState("syncing");
 }
 function flashConnError(msg){
-  const banner = document.getElementById("connBanner");
-  const text = document.getElementById("connBannerText");
-  text.textContent = msg || "通信エラーが発生しました。しばらくして再度お試しください";
-  banner.classList.add("show");
-  clearTimeout(flashConnError._tm);
-  flashConnError._tm = setTimeout(()=>{ if(navigator.onLine) banner.classList.remove("show"); }, 4000);
+  setAtlasConnState(navigator.onLine ? "error" : "offline", msg || "同期エラー・自動再試行中");
 }
 /* エラーの原因（オフライン/権限/その他）を添えたメッセージを作る共通ヘルパー */
 function errDetail(e){
@@ -1798,14 +1865,37 @@ function unsubscribeAll(){
   if(unsubChecks){ unsubChecks(); unsubChecks=null; }
 }
 let atlasRestPollTimer=null, atlasRestPollBusy=false, atlasRestPollTab=null;
+let atlasRestPollFailureCount=0;
 const ATLAS_REST_POLL_MS=4000;
+const ATLAS_REST_BACKOFF_MS=[4000,10000,30000,60000];
+
 function stopAtlasRestPolling(){
-  if(atlasRestPollTimer){clearInterval(atlasRestPollTimer);atlasRestPollTimer=null;}
+  if(atlasRestPollTimer){clearTimeout(atlasRestPollTimer);atlasRestPollTimer=null;}
   atlasRestPollTab=null;
+  atlasRestPollFailureCount=0;
+}
+function atlasScheduleRestPoll(delay){
+  if(atlasRestPollTimer){clearTimeout(atlasRestPollTimer);atlasRestPollTimer=null;}
+  if(!atlasRestPollTab) return;
+  atlasRestPollTimer=setTimeout(()=>{
+    atlasRestPollTimer=null;
+    atlasRestPollOnce(atlasRestPollTab);
+  },Math.max(0,delay));
 }
 async function atlasRestPollOnce(tab){
-  if(atlasRestPollBusy || !atlasRestAuthReady || tab!==currentTab) return;
+  if(atlasRestPollBusy || !atlasRestAuthReady || tab!==currentTab){
+    if(atlasRestPollTab===tab) atlasScheduleRestPoll(ATLAS_REST_POLL_MS);
+    return;
+  }
+  if(!navigator.onLine){
+    setAtlasConnState("offline");
+    atlasRestPollFailureCount=Math.min(atlasRestPollFailureCount+1,ATLAS_REST_BACKOFF_MS.length-1);
+    atlasScheduleRestPoll(ATLAS_REST_BACKOFF_MS[atlasRestPollFailureCount]);
+    return;
+  }
+
   atlasRestPollBusy=true;
+  if(!atlasLastSyncSuccessAt) setAtlasConnState("syncing");
   try{
     const [sd,cd]=await Promise.all([
       atlasFetchDocumentREST("structures",tab),
@@ -1824,16 +1914,28 @@ async function atlasRestPollOnce(tab){
       changed=true;
     }
     if(changed && tab===currentTab) render();
+
+    atlasRestPollFailureCount=0;
+    atlasMarkSyncSuccess();
+    atlasScheduleRestPoll(ATLAS_REST_POLL_MS);
   }catch(err){
-    atlasBootMark("REST同期poll失敗",err&&err.message?err.message:String(err));
-  }finally{atlasRestPollBusy=false;}
+    atlasRestPollFailureCount=Math.min(atlasRestPollFailureCount+1,ATLAS_REST_BACKOFF_MS.length-1);
+    const delay=ATLAS_REST_BACKOFF_MS[atlasRestPollFailureCount];
+    atlasBootMark("REST同期poll失敗 / backoff",Math.round(delay/1000)+"秒 / "+(err&&err.message?err.message:String(err)));
+    setAtlasConnState(navigator.onLine?"error":"offline",
+      navigator.onLine ? "同期エラー・"+Math.round(delay/1000)+"秒後に再試行" : "オフライン・再接続待ち");
+    atlasScheduleRestPoll(delay);
+  }finally{
+    atlasRestPollBusy=false;
+  }
 }
 function startAtlasRestPolling(tab){
   if(atlasRestPollTab===tab && atlasRestPollTimer) return;
-  stopAtlasRestPolling(); atlasRestPollTab=tab;
-  atlasBootMark("REST同期poll開始",tab+" / 4秒");
-  atlasRestPollOnce(tab);
-  atlasRestPollTimer=setInterval(()=>atlasRestPollOnce(tab),ATLAS_REST_POLL_MS);
+  stopAtlasRestPolling();
+  atlasRestPollTab=tab;
+  atlasBootMark("REST同期poll開始",tab+" / 通常4秒・異常時バックオフ");
+  setAtlasConnState(navigator.onLine?"syncing":"offline");
+  atlasScheduleRestPoll(0);
 }
 function subscribeStructure(tab){startAtlasRestPolling(tab);}
 function subscribeChecks(tab){startAtlasRestPolling(tab);}
@@ -3242,7 +3344,7 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.10.1 / APP CHECK INIT FIX",
+    "環境: ATLAS REST BETA TEST 0.11.1 / HEADER STATUS",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
