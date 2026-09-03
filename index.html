@@ -767,7 +767,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · REST POLL TEST 0.8</span>
+      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.9</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
@@ -1059,7 +1059,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-008-REST-POLL-BULK"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-009-FULL-REST"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1187,18 +1187,11 @@ async function initFirebase(){
       firebase.appCheck().activate(RECAPTCHA_V3_SITE_KEY, true);
       atlasBootMark("App Check activate呼出完了");
     }
-    atlasBootMark("Firestoreインスタンス取得開始");
-    db = firebase.firestore();
-    atlasBootMark("Firestoreインスタンス取得完了");
-    // 学校・施設のWi-Fi/ファイアウォールなど一部のネットワークでは、Firestoreが
-    // 標準で使う常時接続(WebChannelのストリーミング)がブロック・妨害され、
-    // 特に書き込み用のWrite/channel接続だけが延々ペンディングのまま固まり、
-    // 読み込みは通るのに書き込みだけ反映されない、という症状が起きることがある。
-    // 通信方式を自動検出の長めポーリング(通常のHTTPリクエストの繰り返し)に
-    // 切り替えることで、この種のネットワーク制限を回避しやすくする。
-    atlasBootMark("Firestore settings開始");
-    try{ db.settings({ experimentalAutoDetectLongPolling: true, merge: true }); atlasBootMark("Firestore settings完了"); }
-    catch(e){ atlasBootMark("Firestore settings失敗", e.message||String(e)); }
+    atlasBootMark("RESTデータ層準備開始");
+    // 0.9ではFirestore Web SDKのデータ通信を使用しない。
+    // db互換インターフェースをREST実装へ差し替える。
+    db = atlasRestDb;
+    atlasBootMark("RESTデータ層準備完了");
     // enablePersistence（IndexedDBへのオフライン永続化）は意図的に無効化している。
     // SafariのIndexedDB実装には、初回アクセス時やバックグラウンド復帰時に
     // open()やトランザクションのPromiseが解決も失敗もせず永久にハングする
@@ -1215,8 +1208,10 @@ async function initFirebase(){
     await atlasRestAuthRequest();
     atlasBootMark("REST Auth起動経路完了");
     firebaseReady=true;
-    atlasStartSdkAuthBackground();
-    atlasBootMark("initFirebase完了","REST read ready / SDK auth background");
+    atlasSdkAuthReady=false;
+    atlasSdkAuthError="FULL REST: SDK書込Auth未使用";
+    updateAtlasWriteAuthBadge();
+    atlasBootMark("initFirebase完了","FULL REST data layer ready");
   }catch(e){
     firebaseReady = false;
     if(e && e.isTimeout){
@@ -1617,7 +1612,7 @@ async function saveStructure(tab){
   try{
     await withDbTimeout(structureRef(tab).set({
       sections: structures[tab],
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      updatedAt: atlasServerTimestamp()
     }), "structure-set-timeout");
     scheduleAutoBackup(tab);
   }catch(e){
@@ -1635,7 +1630,7 @@ async function transactStructure(tab, mutateFn){
         const updated = mutateFn(JSON.parse(JSON.stringify(current)));
         tx.set(structureRef(tab), {
           sections: updated,
-          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+          updatedAt: atlasServerTimestamp()
         });
         structures[tab] = updated;
       }), "structure-transact-timeout");
@@ -1661,7 +1656,7 @@ async function saveChecks(tab){
       await checksRef(tab, todayStr).set({
         data: todayChecked,
         stats: stats,
-        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        updatedAt: atlasServerTimestamp()
       });
       scheduleAutoBackup(tab);
       return;
@@ -1699,7 +1694,7 @@ function sleep(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
         const ref=checksRef(tab,todayStr), snap=await tx.get(ref);
         const cur=(snap.exists&&snap.data()&&snap.data().data)?snap.data().data:{};
         const u=mutateFn(JSON.parse(JSON.stringify(cur)));
-        tx.set(ref,{data:u,stats:countStats(tab,u),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+        tx.set(ref,{data:u,stats:countStats(tab,u),updatedAt:atlasServerTimestamp()});
       });
       scheduleAutoBackup(tab); return true;
     }catch(e2){connErrFail("本日のチェック状態の保存",e2);return false;}
@@ -2474,7 +2469,7 @@ async function createBackup(silent){
       checks: todayChecked,
       day: todayStr,
       auto: !!silent,
-      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      createdAt: atlasServerTimestamp()
     }), "backup-add-timeout");
     if(!silent) showToast("保存しました");
     await pruneBackups();
@@ -2943,7 +2938,7 @@ async function createDutyBackup(silent){
       roster: roster.slice(),
       specialDates: JSON.parse(JSON.stringify(specialDates)),
       auto: !!silent,
-      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      createdAt: atlasServerTimestamp()
     });
     if(!silent) showToast("保存しました");
     await pruneDutyBackups();
@@ -3236,14 +3231,15 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.8 / Latest Mainline Source",
+    "環境: ATLAS REST BETA TEST 0.9 / FULL REST MIGRATION",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
         "Firebase: "+(firebaseReady?"接続済み":"未接続"),
     "REST Auth: "+(atlasRestAuthReady?"準備済み":"未準備"),
-    "SDK書込Auth: "+(atlasSdkAuthReady?"準備済み":(atlasSdkAuthError?"エラー: "+atlasSdkAuthError:"準備中")),
+    "データ通信: FULL REST（Firestore Web SDK read/write未使用）",
     "同期方式: RESTポーリング（4秒）",
+    "REST書込: 有効",
     "Safari: "+safari+" / WebKit: "+webkit,
     "",
     "起動完了まで: "+(atlasDevDiag.startup.totalMs==null?"計測中":atlasDevDiag.startup.totalMs+"ms"),
@@ -3284,9 +3280,9 @@ function renderAtlasDevDiag(){
   if(el) el.textContent=atlasDiagText();
 }
 function atlasRequireSdkWriteAuth(actionLabel){
-  if(atlasSdkAuthReady && firebase.auth().currentUser) return true;
-  const msg=(actionLabel||"保存")+"は書込認証の準備完了後に利用できます";
-  if(typeof showToast==="function") showToast("書込認証を準備中です。数秒後に再試行してください");
+  if(atlasRestAuthReady && atlasRestIdToken) return true;
+  const msg=(actionLabel||"保存")+"はREST認証の準備完了後に利用できます";
+  if(typeof showToast==="function") showToast("通信認証を準備中です。少し待って再試行してください");
   atlasBootMark("書込ガード",msg);
   return false;
 }
@@ -3316,7 +3312,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.8";
+const ATLAS_REST_MAINLINE_VERSION = "0.9";
 const REST_READ_TIMEOUT_MS = 12000;
 let atlasRestIdToken="";
 let atlasRestRefreshToken="";
@@ -3416,13 +3412,248 @@ async function atlasRestAuthHeaders(){
 function atlasRestDocName(collection,id){
   return `projects/${firebaseConfig.projectId}/databases/(default)/documents/${collection}/${id}`;
 }
+const ATLAS_SERVER_TIMESTAMP={__atlasServerTimestamp:true};
+function atlasServerTimestamp(){ return ATLAS_SERVER_TIMESTAMP; }
+function atlasTimestampWrap(v){
+  return {
+    __atlasTimestamp:v,
+    toDate(){ return new Date(v); },
+    toJSON(){ return v; },
+    toString(){ return v; }
+  };
+}
+function atlasIsTimestampWrap(v){ return !!(v&&v.__atlasTimestamp); }
+
+function atlasEncodeFirestoreValueFull(v){
+  if(v===ATLAS_SERVER_TIMESTAMP) return null; // handled as transform
+  if(atlasIsTimestampWrap(v)) return {timestampValue:v.__atlasTimestamp};
+  if(v===null||v===undefined) return {nullValue:null};
+  if(typeof v==="boolean") return {booleanValue:v};
+  if(typeof v==="number") return Number.isInteger(v)?{integerValue:String(v)}:{doubleValue:v};
+  if(typeof v==="string") return {stringValue:v};
+  if(Array.isArray(v)) return {arrayValue:{values:v.map(atlasEncodeFirestoreValueFull)}};
+  if(typeof v==="object"){
+    const fields={};
+    Object.keys(v).forEach(k=>{
+      if(v[k]!==ATLAS_SERVER_TIMESTAMP) fields[k]=atlasEncodeFirestoreValueFull(v[k]);
+    });
+    return {mapValue:{fields}};
+  }
+  return {stringValue:String(v)};
+}
+function atlasEncodeTopLevel(data){
+  const fields={}, transforms=[];
+  Object.keys(data||{}).forEach(k=>{
+    if(data[k]===ATLAS_SERVER_TIMESTAMP){
+      transforms.push({fieldPath:k,setToServerValue:"REQUEST_TIME"});
+    }else{
+      fields[k]=atlasEncodeFirestoreValueFull(data[k]);
+    }
+  });
+  return {fields,transforms};
+}
+function atlasDecodeFirestoreValueFull(v){
+  if(!v||typeof v!=="object") return null;
+  if("nullValue" in v) return null;
+  if("booleanValue" in v) return !!v.booleanValue;
+  if("integerValue" in v) return Number(v.integerValue);
+  if("doubleValue" in v) return Number(v.doubleValue);
+  if("timestampValue" in v) return atlasTimestampWrap(v.timestampValue);
+  if("stringValue" in v) return v.stringValue;
+  if("referenceValue" in v) return v.referenceValue;
+  if("geoPointValue" in v) return v.geoPointValue;
+  if("bytesValue" in v) return v.bytesValue;
+  if("arrayValue" in v) return ((v.arrayValue&&v.arrayValue.values)||[]).map(atlasDecodeFirestoreValueFull);
+  if("mapValue" in v){
+    const out={}, fields=(v.mapValue&&v.mapValue.fields)||{};
+    Object.keys(fields).forEach(k=>out[k]=atlasDecodeFirestoreValueFull(fields[k]));
+    return out;
+  }
+  return null;
+}
+function atlasDecodeDocumentFull(doc){
+  const data={}, fields=(doc&&doc.fields)||{};
+  Object.keys(fields).forEach(k=>data[k]=atlasDecodeFirestoreValueFull(fields[k]));
+  return data;
+}
+function atlasRestRandomId(){
+  const chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let s=""; crypto.getRandomValues(new Uint8Array(20)).forEach(n=>s+=chars[n%chars.length]); return s;
+}
+async function atlasRestCommit(writes){
+  const headers=await atlasRestAuthHeaders();
+  const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:commit`;
+  const res=await fetch(url,{method:"POST",headers,body:JSON.stringify({writes}),cache:"no-store"});
+  const raw=await res.text();
+  if(!res.ok) throw new Error(`REST COMMIT HTTP ${res.status}: ${raw.slice(0,500)}`);
+  return raw?JSON.parse(raw):{};
+}
+function atlasRestWriteForSet(collection,id,data,merge,precondition){
+  const enc=atlasEncodeTopLevel(data||{});
+  const write={
+    update:{name:atlasRestDocName(collection,id),fields:enc.fields}
+  };
+  if(merge) write.updateMask={fieldPaths:Object.keys(enc.fields)};
+  if(enc.transforms.length) write.updateTransforms=enc.transforms;
+  if(precondition) write.currentDocument=precondition;
+  return write;
+}
+async function atlasRestSetDoc(collection,id,data,opts,precondition){
+  const write=atlasRestWriteForSet(collection,id,data,!!(opts&&opts.merge),precondition);
+  await atlasRestCommit([write]);
+}
+async function atlasRestDeleteDoc(collection,id,precondition){
+  const w={delete:atlasRestDocName(collection,id)};
+  if(precondition) w.currentDocument=precondition;
+  await atlasRestCommit([w]);
+}
+function atlasRestDocSnap(collection,id,doc){
+  const exists=!!doc;
+  return {
+    id, exists,
+    updateTime:doc&&doc.updateTime?doc.updateTime:null,
+    ref:atlasRestCollection(collection).doc(id),
+    data(){ return exists?atlasDecodeDocumentFull(doc):undefined; }
+  };
+}
+async function atlasRestGetDocRaw(collection,id){
+  const headers=await atlasRestAuthHeaders();
+  const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}/${encodeURIComponent(id)}`;
+  const res=await fetch(url,{headers,cache:"no-store"});
+  if(res.status===404) return null;
+  const raw=await res.text();
+  if(!res.ok) throw new Error(`REST GET HTTP ${res.status}: ${raw.slice(0,500)}`);
+  return raw?JSON.parse(raw):null;
+}
+function atlasRestQueryOp(op){
+  return ({
+    "==":"EQUAL","<":"LESS_THAN","<=":"LESS_THAN_OR_EQUAL",
+    ">":"GREATER_THAN",">=":"GREATER_THAN_OR_EQUAL"
+  })[op]||"EQUAL";
+}
+function atlasRestFilterValue(collection,field,value){
+  if(field==="__name__"){
+    return {referenceValue:atlasRestDocName(collection,String(value))};
+  }
+  return atlasEncodeFirestoreValueFull(value);
+}
+async function atlasRestRunQuery(collection,state){
+  const headers=await atlasRestAuthHeaders();
+  const sq={from:[{collectionId:collection}]};
+  if(state.filters.length===1){
+    const f=state.filters[0];
+    sq.where={fieldFilter:{field:{fieldPath:f.field},op:atlasRestQueryOp(f.op),value:atlasRestFilterValue(collection,f.field,f.value)}};
+  }else if(state.filters.length>1){
+    sq.where={compositeFilter:{op:"AND",filters:state.filters.map(f=>({fieldFilter:{
+      field:{fieldPath:f.field},op:atlasRestQueryOp(f.op),value:atlasRestFilterValue(collection,f.field,f.value)
+    }}))}};
+  }
+  if(state.orders.length) sq.orderBy=state.orders.map(o=>({field:{fieldPath:o.field},direction:(o.dir||"asc").toLowerCase()==="desc"?"DESCENDING":"ASCENDING"}));
+  if(state.limit!=null) sq.limit=state.limit;
+  const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:runQuery`;
+  const res=await fetch(url,{method:"POST",headers,body:JSON.stringify({structuredQuery:sq}),cache:"no-store"});
+  const raw=await res.text();
+  if(!res.ok) throw new Error(`REST QUERY HTTP ${res.status}: ${raw.slice(0,500)}`);
+  const rows=raw?JSON.parse(raw):[];
+  const docs=(Array.isArray(rows)?rows:[]).filter(r=>r&&r.document).map(r=>{
+    const name=r.document.name||"", id=name.split("/").pop();
+    return atlasRestDocSnap(collection,id,r.document);
+  });
+  return {docs,forEach(cb){docs.forEach(cb);},empty:docs.length===0,size:docs.length};
+}
+function atlasRestQuery(collection,state){
+  const s={filters:[...(state&&state.filters||[])],orders:[...(state&&state.orders||[])],limit:state&&state.limit!=null?state.limit:null};
+  return {
+    where(field,op,value){ return atlasRestQuery(collection,{...s,filters:[...s.filters,{field:String(field),op,value}]}); },
+    orderBy(field,dir){ return atlasRestQuery(collection,{...s,orders:[...s.orders,{field:String(field),dir:dir||"asc"}]}); },
+    limit(n){ return atlasRestQuery(collection,{...s,limit:n}); },
+    async get(){ return atlasRestRunQuery(collection,s); }
+  };
+}
+function atlasRestCollection(collection){
+  return {
+    doc(id){
+      return {
+        id,
+        async get(){ return atlasRestDocSnap(collection,id,await atlasRestGetDocRaw(collection,id)); },
+        async set(data,opts){ return atlasRestSetDoc(collection,id,data,opts||null); },
+        async update(data){ return atlasRestSetDoc(collection,id,data,{merge:true}); },
+        async delete(){ return atlasRestDeleteDoc(collection,id); }
+      };
+    },
+    async add(data){
+      const id=atlasRestRandomId();
+      await atlasRestSetDoc(collection,id,data,null);
+      return this.doc(id);
+    },
+    where(field,op,value){ return atlasRestQuery(collection,{filters:[{field:String(field),op,value}],orders:[],limit:null}); },
+    orderBy(field,dir){ return atlasRestQuery(collection,{filters:[],orders:[{field:String(field),dir:dir||"asc"}],limit:null}); },
+    limit(n){ return atlasRestQuery(collection,{filters:[],orders:[],limit:n}); },
+    async get(){ return atlasRestRunQuery(collection,{filters:[],orders:[],limit:null}); }
+  };
+}
+const atlasRestDb={
+  collection(name){ return atlasRestCollection(name); },
+  async runTransaction(fn){
+    for(let attempt=0;attempt<3;attempt++){
+      const readTimes=new Map(), writes=[];
+      const tx={
+        async get(ref){
+          const snap=await ref.get();
+          readTimes.set(ref,snap.updateTime);
+          return snap;
+        },
+        set(ref,data,opts){
+          const rt=readTimes.get(ref);
+          const pre=rt?{updateTime:rt}:undefined;
+          writes.push(atlasRestWriteForSet(ref._collection||ref.collectionName||"",ref.id,data,!!(opts&&opts.merge),pre));
+        },
+        update(ref,data){
+          const rt=readTimes.get(ref);
+          const pre=rt?{updateTime:rt}:undefined;
+          writes.push(atlasRestWriteForSet(ref._collection||ref.collectionName||"",ref.id,data,true,pre));
+        },
+        delete(ref){
+          const rt=readTimes.get(ref);
+          const w={delete:atlasRestDocName(ref._collection||ref.collectionName||"",ref.id)};
+          if(rt) w.currentDocument={updateTime:rt};
+          writes.push(w);
+        }
+      };
+      // refs need collection identity; decorate via proxy-ish fallback below
+      try{
+        const result=await fn(tx);
+        if(writes.length) await atlasRestCommit(writes);
+        return result;
+      }catch(e){
+        const msg=String(e&&e.message||e);
+        if(attempt<2 && /409|ABORT|FAILED_PRECONDITION/i.test(msg)) continue;
+        throw e;
+      }
+    }
+  }
+};
+// decorate doc refs with collection name for transaction commit.
+const _atlasRestCollection=atlasRestCollection;
+atlasRestCollection=function(collection){
+  const base=_atlasRestCollection(collection);
+  const oldDoc=base.doc.bind(base);
+  base.doc=(id)=>{
+    const r=oldDoc(id);
+    r._collection=collection;
+    r.collectionName=collection;
+    return r;
+  };
+  return base;
+};
+
 function atlasDecodeFirestoreValue(v){
   if(!v || typeof v!=="object") return null;
   if("nullValue" in v) return null;
   if("booleanValue" in v) return !!v.booleanValue;
   if("integerValue" in v) return Number(v.integerValue);
   if("doubleValue" in v) return Number(v.doubleValue);
-  if("timestampValue" in v) return v.timestampValue;
+  if("timestampValue" in v) return atlasTimestampWrap(v.timestampValue);
   if("stringValue" in v) return v.stringValue;
   if("referenceValue" in v) return v.referenceValue;
   if("geoPointValue" in v) return v.geoPointValue;
@@ -3580,8 +3811,8 @@ async function loadPreferencesRange(dateStrs){
     console.warn("希望表REST読取に失敗。Web SDKへフォールバックします:",restError);
     try{
       const queryPromise=preferencesCol()
-        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
-        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
+        .where("__name__", ">=", startId)
+        .where("__name__", "<=", endId)
         .get();
       const snap=await withPreferenceLongWait(queryPromise,"preferencesRange-sdk-fallback-timeout");
       docs=[];
@@ -3652,7 +3883,7 @@ async function togglePreference(dateStr){
       const saved = {
         wants,
         priority,
-        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        updatedAt: atlasServerTimestamp()
       };
       // merge:true で map を保存すると、削除した名前が Firestore 側に残ることがある。
       // 既存ドキュメントでは wants / priority の map 自体を置換して、削除を確実に反映する。
@@ -3690,7 +3921,7 @@ async function togglePriority(dateStr){
       if(wasOn) delete priority[myName]; else priority[myName] = true;
       tx.set(ref, {
         priority,
-        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        updatedAt: atlasServerTimestamp()
       }, { merge:true });
     }), "priorityToggle-transaction-timeout");
   }catch(e){
@@ -3723,25 +3954,8 @@ async function loadCalendarRange(dateStrs){
   }catch(restError){
     atlasDevDiag.calendar.fail++;
     atlasDevDiag.calendar.error=restError.message||String(restError);
-    console.warn("カレンダーREST読取に失敗。Web SDKへフォールバックします:",restError);
-    try{
-      const snap=await withDbTimeout(
-        calendarCol()
-          .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
-          .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
-          .get(),
-        "calendarRange-sdk-fallback-timeout"
-      );
-      docs=[];
-      snap.forEach(doc=>docs.push({id:doc.id,data:doc.data()||{}}));
-      atlasDevDiag.calendar.route="SDK fallback";
-      atlasDevDiag.calendar.ms=Math.round(performance.now()-atlasCalStarted);
-      atlasDevDiag.calendar.count=docs.length;
-      atlasDevDiag.calendar.fallback++;
-      atlasDiagPush("カレンダー","fallback-success",atlasDevDiag.calendar.ms,"calendarRange-sdk-fallback",docs.length+"件");
-    }catch(e){
-      return; // 従来仕様どおり、取得失敗時は既存表示を保持する。
-    }
+    console.warn("カレンダーREST読取に失敗。既存表示を維持します:",restError);
+    return;
   }
   dateStrs.forEach(ds=>{ calendarAssign[ds]=[]; calendarChanged[ds]=false; calendarPrevious[ds]=[]; });
   (docs||[]).forEach(doc=>{
@@ -3795,7 +4009,7 @@ async function saveCalendarDay(dateStr, people, markChanged){
       people,
       changed: !!markChanged,
       previousPeople,
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      updatedAt: atlasServerTimestamp()
     });
     showToast(markChanged ? "変更マーク付きで保存しました" : "保存しました");
   }catch(e){
@@ -4439,7 +4653,7 @@ async function pruneOldLogs(col){
   if(!firebaseReady) return;
   try{
     const oldest = oldestKeptLogDate();
-    const q = await col.where(firebase.firestore.FieldPath.documentId(), "<", oldest).get();
+    const q = await col.where("__name__", "<", oldest).get();
     for(const d of q.docs){ await d.ref.delete(); }
   }catch(e){ /* 整理失敗は致命的でないため無視 */ }
 }
@@ -4501,7 +4715,7 @@ async function saveKanribo(){
     co2Cur: document.getElementById("krCo2Cur").value.trim(),
     pressure1: document.getElementById("krP1").value.trim(),
     pressure2: document.getElementById("krP2").value.trim(),
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    updatedAt: atlasServerTimestamp()
   };
   try{
     await kanriboCol().doc(getTodayStr()).set(data, { merge:true });
@@ -4520,8 +4734,8 @@ async function loadKanriboHistory(){
     const oldest = oldestKeptLogDate();
     const today = getTodayStr();
     const q = await withDbTimeout(kanriboCol()
-      .where(firebase.firestore.FieldPath.documentId(), ">=", oldest)
-      .where(firebase.firestore.FieldPath.documentId(), "<=", today)
+      .where("__name__", ">=", oldest)
+      .where("__name__", "<=", today)
       .get(), "kanriboHistory-get-timeout");
     kanriboRecords = q.docs.map(d=>Object.assign({ date:d.id }, d.data())).sort((a,b)=> a.date < b.date ? 1 : -1);
     kanriboPage = 0;
@@ -4625,7 +4839,7 @@ async function saveBaiyoeki(){
     ec: document.getElementById("beEc").value.trim(),
     ph: document.getElementById("bePh").value.trim(),
     level: document.getElementById("beLevel").value.trim(),
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    updatedAt: atlasServerTimestamp()
   };
   try{
     await baiyoekiCol().doc(getTodayStr()).set(data, { merge:true });
@@ -4644,8 +4858,8 @@ async function loadBaiyoekiHistory(){
     const oldest = oldestKeptLogDate();
     const today = getTodayStr();
     const q = await withDbTimeout(baiyoekiCol()
-      .where(firebase.firestore.FieldPath.documentId(), ">=", oldest)
-      .where(firebase.firestore.FieldPath.documentId(), "<=", today)
+      .where("__name__", ">=", oldest)
+      .where("__name__", "<=", today)
       .get(), "baiyoekiHistory-get-timeout");
     baiyoekiRecords = q.docs.map(d=>Object.assign({ date:d.id }, d.data())).sort((a,b)=> a.date < b.date ? 1 : -1);
     baiyoekiPage = 0;
