@@ -767,7 +767,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.9.1</span>
+      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
@@ -1059,7 +1059,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-0091-FULL-REST-AUTH-CLEANUP"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-010-FULL-REST-APPCHECK"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1188,7 +1188,7 @@ async function initFirebase(){
       atlasBootMark("App Check activate呼出完了");
     }
     atlasBootMark("RESTデータ層準備開始");
-    // 0.9ではFirestore Web SDKのデータ通信を使用しない。
+    // 0.10ではFirestore Web SDKのデータ通信を使用せず、Firestore RESTへApp Checkを付与する。
     // db互換インターフェースをREST実装へ差し替える。
     db = atlasRestDb;
     atlasBootMark("RESTデータ層準備完了");
@@ -1207,6 +1207,9 @@ async function initFirebase(){
     setLoadingStep("REST認証中…");
     await atlasRestAuthRequest();
     atlasBootMark("REST Auth起動経路完了");
+    atlasBootMark("App Check token取得開始");
+    await atlasGetAppCheckToken();
+    atlasBootMark("App Check token取得完了");
     firebaseReady=true;
     atlasSdkAuthReady=false;
     atlasSdkAuthError="";
@@ -3231,12 +3234,17 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.9.1 / FULL REST AUTH CLEANUP",
+    "環境: ATLAS REST BETA TEST 0.10 / FULL REST + APP CHECK",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
         "Firebase: "+(firebaseReady?"接続済み":"未接続"),
     "REST Auth: "+(atlasRestAuthReady?"準備済み":"未準備"),
+    "App Check: "+(atlasAppCheckReady?"準備済み":"未準備"),
+    "REST App Check header: "+(atlasAppCheckHeaderCount>0?"付与済み":"未送信"),
+    "App Check header送信回数: "+atlasAppCheckHeaderCount,
+    "App Check最終token取得: "+(atlasAppCheckLastTokenAt?new Date(atlasAppCheckLastTokenAt).toLocaleTimeString():"—"),
+    "App Check最終エラー: "+(atlasAppCheckLastError||"—"),
     "データ通信: FULL REST（Firestore Web SDK read/write未使用）",
     "書込認証: REST Auth",
     "旧SDK書込認証: 使用しない",
@@ -3317,8 +3325,47 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.9.1";
+const ATLAS_REST_MAINLINE_VERSION = "0.10";
 const REST_READ_TIMEOUT_MS = 12000;
+let atlasAppCheckReady=false;
+let atlasAppCheckLastError="";
+let atlasAppCheckLastTokenAt=0;
+let atlasAppCheckHeaderCount=0;
+
+async function atlasGetAppCheckToken(){
+  if(!RECAPTCHA_V3_SITE_KEY || RECAPTCHA_V3_SITE_KEY === "YOUR_RECAPTCHA_V3_SITE_KEY"){
+    atlasAppCheckReady=false;
+    atlasAppCheckLastError="reCAPTCHA site key unavailable";
+    throw new Error("App Check/reCAPTCHA site key unavailable");
+  }
+  try{
+    const appCheck=firebase.appCheck();
+    const result=await atlasRestTimeout(
+      appCheck.getToken(false),
+      10000,
+      "appcheck-token"
+    );
+    const token=result && result.token ? result.token : "";
+    if(!token) throw new Error("App Check token missing");
+    atlasAppCheckReady=true;
+    atlasAppCheckLastError="";
+    atlasAppCheckLastTokenAt=Date.now();
+    return token;
+  }catch(e){
+    atlasAppCheckReady=false;
+    atlasAppCheckLastError=(e&&e.message)||String(e);
+    throw e;
+  }
+}
+
+async function atlasRestSecureHeaders(){
+  const headers=await atlasRestAuthHeaders();
+  const appCheckToken=await atlasGetAppCheckToken();
+  headers["X-Firebase-AppCheck"]=appCheckToken;
+  atlasAppCheckHeaderCount++;
+  return headers;
+}
+
 let atlasRestIdToken="";
 let atlasRestRefreshToken="";
 let atlasRestAuthReady=false;
@@ -3466,7 +3513,7 @@ function atlasRestRandomId(){
   let s=""; crypto.getRandomValues(new Uint8Array(20)).forEach(n=>s+=chars[n%chars.length]); return s;
 }
 async function atlasRestCommit(writes){
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:commit`;
   const res=await fetch(url,{method:"POST",headers,body:JSON.stringify({writes}),cache:"no-store"});
   const raw=await res.text();
@@ -3502,7 +3549,7 @@ function atlasRestDocSnap(collection,id,doc){
   };
 }
 async function atlasRestGetDocRaw(collection,id){
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}/${encodeURIComponent(id)}`;
   const res=await fetch(url,{headers,cache:"no-store"});
   if(res.status===404) return null;
@@ -3523,7 +3570,7 @@ function atlasRestFilterValue(collection,field,value){
   return atlasEncodeFirestoreValueFull(value);
 }
 async function atlasRestRunQuery(collection,state){
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const sq={from:[{collectionId:collection}]};
   if(state.filters.length===1){
     const f=state.filters[0];
@@ -3660,7 +3707,7 @@ function atlasDecodeFirestoreDocument(doc){
 }
 async function atlasFetchCollectionRangeREST(collection,startId,endId){
   const atlasRestStarted=performance.now();
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:runQuery`;
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),REST_READ_TIMEOUT_MS);
@@ -3702,7 +3749,7 @@ function atlasEncodeFirestoreMap(obj){
   const fields={}; Object.keys(obj||{}).forEach(k=>fields[k]=atlasEncodeFirestoreValue(obj[k])); return fields;
 }
 async function atlasPatchDocumentREST(collection,id,fields){
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}/${encodeURIComponent(id)}`;
   const body={fields:atlasEncodeFirestoreMap(fields||{})};
   const c=new AbortController(), timer=setTimeout(()=>c.abort(),REST_READ_TIMEOUT_MS);
@@ -3716,7 +3763,7 @@ async function atlasPatchDocumentREST(collection,id,fields){
 
 async function atlasFetchCollectionAllREST(collection){
   const started=performance.now();
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents:runQuery`;
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),REST_READ_TIMEOUT_MS);
@@ -3736,7 +3783,7 @@ async function atlasFetchCollectionAllREST(collection){
 
 async function atlasFetchDocumentREST(collection,id){
   const started=performance.now();
-  const headers=await atlasRestAuthHeaders();
+  const headers=await atlasRestSecureHeaders();
   const url=`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/${encodeURIComponent(collection)}/${encodeURIComponent(id)}`;
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),REST_READ_TIMEOUT_MS);
