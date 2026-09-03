@@ -767,7 +767,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10</span>
+      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10.1</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
@@ -1059,7 +1059,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-010-FULL-REST-APPCHECK"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-0101-APPCHECK-INIT-FIX"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1207,9 +1207,16 @@ async function initFirebase(){
     setLoadingStep("REST認証中…");
     await atlasRestAuthRequest();
     atlasBootMark("REST Auth起動経路完了");
-    atlasBootMark("App Check token取得開始");
-    await atlasGetAppCheckToken();
-    atlasBootMark("App Check token取得完了");
+    // App Check事前確認の失敗だけでFirebase初期化全体を落とさない。
+    // Firestore REST実行時は atlasRestSecureHeaders() がtokenを必須取得する。
+    atlasBootMark("App Check token事前確認開始");
+    try{
+      await atlasGetAppCheckToken();
+      atlasBootMark("App Check token事前確認完了");
+    }catch(e){
+      atlasBootMark("App Check token事前確認失敗 / REST通信時に再試行",
+        (e&&e.message)||String(e));
+    }
     firebaseReady=true;
     atlasSdkAuthReady=false;
     atlasSdkAuthError="";
@@ -3234,13 +3241,13 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.10 / FULL REST + APP CHECK",
+    "環境: ATLAS REST BETA TEST 0.10.1 / APP CHECK INIT FIX",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
         "Firebase: "+(firebaseReady?"接続済み":"未接続"),
     "REST Auth: "+(atlasRestAuthReady?"準備済み":"未準備"),
-    "App Check: "+(atlasAppCheckReady?"準備済み":"未準備"),
+    "App Check: "+(atlasAppCheckReady?"準備済み":"未準備（REST通信時再試行）"),
     "REST App Check header: "+(atlasAppCheckHeaderCount>0?"付与済み":"未送信"),
     "App Check header送信回数: "+atlasAppCheckHeaderCount,
     "App Check最終token取得: "+(atlasAppCheckLastTokenAt?new Date(atlasAppCheckLastTokenAt).toLocaleTimeString():"—"),
@@ -3325,7 +3332,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.10";
+const ATLAS_REST_MAINLINE_VERSION = "0.10.1";
 const REST_READ_TIMEOUT_MS = 12000;
 let atlasAppCheckReady=false;
 let atlasAppCheckLastError="";
