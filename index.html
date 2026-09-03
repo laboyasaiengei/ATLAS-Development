@@ -767,7 +767,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.9</span>
+      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.9.1</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
@@ -1059,7 +1059,7 @@ const RECAPTCHA_V3_SITE_KEY = "6LcAppctAAAAAMGN6vJnQqITfS-nH4-A3-Tg5uLu";
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-009-FULL-REST"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-0091-FULL-REST-AUTH-CLEANUP"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1209,7 +1209,7 @@ async function initFirebase(){
     atlasBootMark("REST Auth起動経路完了");
     firebaseReady=true;
     atlasSdkAuthReady=false;
-    atlasSdkAuthError="FULL REST: SDK書込Auth未使用";
+    atlasSdkAuthError="";
     updateAtlasWriteAuthBadge();
     atlasBootMark("initFirebase完了","FULL REST data layer ready");
   }catch(e){
@@ -3231,13 +3231,15 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.9 / FULL REST MIGRATION",
+    "環境: ATLAS REST BETA TEST 0.9.1 / FULL REST AUTH CLEANUP",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
         "Firebase: "+(firebaseReady?"接続済み":"未接続"),
     "REST Auth: "+(atlasRestAuthReady?"準備済み":"未準備"),
     "データ通信: FULL REST（Firestore Web SDK read/write未使用）",
+    "書込認証: REST Auth",
+    "旧SDK書込認証: 使用しない",
     "同期方式: RESTポーリング（4秒）",
     "REST書込: 有効",
     "Safari: "+safari+" / WebKit: "+webkit,
@@ -3282,8 +3284,8 @@ function renderAtlasDevDiag(){
 function atlasRequireSdkWriteAuth(actionLabel){
   if(atlasRestAuthReady && atlasRestIdToken) return true;
   const msg=(actionLabel||"保存")+"はREST認証の準備完了後に利用できます";
-  if(typeof showToast==="function") showToast("通信認証を準備中です。少し待って再試行してください");
-  atlasBootMark("書込ガード",msg);
+  if(typeof showToast==="function") showToast("REST認証を準備中です。少し待って再試行してください");
+  atlasBootMark("REST書込ガード",msg);
   return false;
 }
 
@@ -3291,9 +3293,12 @@ function updateAtlasWriteAuthBadge(){
   const el=document.getElementById("atlasWriteAuthBadge");
   if(!el) return;
   el.classList.remove("ready","error");
-  if(atlasSdkAuthReady){el.textContent="書込認証OK";el.classList.add("ready");}
-  else if(atlasSdkAuthError){el.textContent="書込認証エラー";el.classList.add("error");}
-  else el.textContent="書込認証準備中";
+  if(atlasRestAuthReady && atlasRestIdToken){
+    el.textContent="FULL REST";
+    el.classList.add("ready");
+  }else{
+    el.textContent="REST認証準備中";
+  }
 }
 function initAtlasDevDiagUI(){
   const btn=document.getElementById("devDiagBtn");
@@ -3312,7 +3317,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.9";
+const ATLAS_REST_MAINLINE_VERSION = "0.9.1";
 const REST_READ_TIMEOUT_MS = 12000;
 let atlasRestIdToken="";
 let atlasRestRefreshToken="";
@@ -3365,31 +3370,11 @@ async function atlasRestAuthRequest(){
 }
 
 async function atlasStartSdkAuthBackground(){
-  atlasBootMark("SDK Authバックグラウンド開始");
-  try{
-    try{
-      await withTimeout(firebase.auth().setPersistence(firebase.auth.Auth.Persistence.NONE),1200,"sdk-persistence-bg-timeout");
-      atlasBootMark("SDK Auth persistence完了");
-    }catch(e){
-      atlasBootMark("SDK Auth persistence失敗/継続",e.message||String(e));
-    }
-    await withTimeout(new Promise((resolve,reject)=>{
-      const cur=firebase.auth().currentUser;
-      if(cur){resolve(cur);return;}
-      let unsub=null;
-      unsub=firebase.auth().onAuthStateChanged(user=>{if(user){if(unsub)unsub();resolve(user);}},reject);
-      firebase.auth().signInAnonymously().catch(reject);
-    }),12000,"sdk-auth-bg-timeout");
-    atlasSdkAuthReady=true;
-    firebaseReady=true;
-    atlasBootMark("SDK Authバックグラウンド完了");
-    updateAtlasWriteAuthBadge();
-    atlasBootMark("SDK書込Auth利用可能",currentTab);
-  }catch(e){
-    atlasSdkAuthError=e.message||String(e);
-    atlasBootMark("SDK Authバックグラウンド失敗",atlasSdkAuthError);
-    updateAtlasWriteAuthBadge();
-  }
+  // 0.9.1 FULL REST: obsolete compatibility shim. No Firestore SDK write-auth startup.
+  atlasSdkAuthReady=false;
+  atlasSdkAuthError="";
+  updateAtlasWriteAuthBadge();
+  return false;
 }
 
 
