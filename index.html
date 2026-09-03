@@ -767,7 +767,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10.1</span>
+      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10.2</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <span class="date-pill" id="datePill">–</span>
@@ -1053,13 +1053,13 @@ const firebaseConfig = {
 };
 const EXPECTED_ATLAS_ENV = "DEVELOPER_BETA";
 const EXPECTED_FIREBASE_PROJECT_ID = "atlas-development-4eec2";
-// Firebase Console → App Check → このアプリを登録 → reCAPTCHA v3 で発行されたサイトキーを貼る
-const RECAPTCHA_V3_SITE_KEY = "6LftpaYtAAAAALUoyIyDoVjHFLG1io5wzgLEflRr";
+// Firebase Console → App Check → reCAPTCHA Enterprise に登録した Web キー（Key ID / site key）
+const RECAPTCHA_ENTERPRISE_SITE_KEY = "6LftpaYtAAAAALUoyIyDoVjHFLG1io5wzgLEflRr";
 // ローカルで動作確認する時だけ有効化（本番公開時はコメントアウトのままでOK）
 // self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
    
 const HISTORY_DAYS = 7; // 過去何日分の記録を保持するか
-const PROTOCOL_REV = "REST-BETA-MAINLINE-SOURCE-0101-APPCHECK-INIT-FIX"; // Developer Beta only
+const PROTOCOL_REV = "REST-BETA-0102-RECAPTCHA-ENTERPRISE"; // Developer Beta only
 const BACKUP_LIMIT = 100; // バックアップの保持件数
 
 let db = null;
@@ -1182,10 +1182,11 @@ async function initFirebase(){
     atlasBootMark("firebase.initializeApp開始");
     firebase.initializeApp(firebaseConfig);
     atlasBootMark("firebase.initializeApp完了");
-    if(RECAPTCHA_V3_SITE_KEY && RECAPTCHA_V3_SITE_KEY !== "YOUR_RECAPTCHA_V3_SITE_KEY"){
-      atlasBootMark("App Check activate開始");
-      firebase.appCheck().activate(RECAPTCHA_V3_SITE_KEY, true);
-      atlasBootMark("App Check activate呼出完了");
+    if(RECAPTCHA_ENTERPRISE_SITE_KEY && RECAPTCHA_ENTERPRISE_SITE_KEY !== "YOUR_RECAPTCHA_ENTERPRISE_SITE_KEY"){
+      atlasBootMark("App Check Enterprise activate開始");
+      const enterpriseProvider = new firebase.appCheck.ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY);
+      firebase.appCheck().activate(enterpriseProvider, true);
+      atlasBootMark("App Check Enterprise activate呼出完了");
     }
     atlasBootMark("RESTデータ層準備開始");
     // 0.10ではFirestore Web SDKのデータ通信を使用せず、Firestore RESTへApp Checkを付与する。
@@ -3332,7 +3333,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.10.1";
+const ATLAS_REST_MAINLINE_VERSION = "0.10.2";
 const REST_READ_TIMEOUT_MS = 12000;
 let atlasAppCheckReady=false;
 let atlasAppCheckLastError="";
@@ -3340,7 +3341,7 @@ let atlasAppCheckLastTokenAt=0;
 let atlasAppCheckHeaderCount=0;
 
 async function atlasGetAppCheckToken(){
-  if(!RECAPTCHA_V3_SITE_KEY || RECAPTCHA_V3_SITE_KEY === "YOUR_RECAPTCHA_V3_SITE_KEY"){
+  if(!RECAPTCHA_ENTERPRISE_SITE_KEY || RECAPTCHA_ENTERPRISE_SITE_KEY === "YOUR_RECAPTCHA_ENTERPRISE_SITE_KEY"){
     atlasAppCheckReady=false;
     atlasAppCheckLastError="reCAPTCHA site key unavailable";
     throw new Error("App Check/reCAPTCHA site key unavailable");
