@@ -790,6 +790,38 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     font-size:8.8px !important;
   }
 }
+
+.status-refresh-row{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:4px;
+}
+.duty-refresh-btn{
+  display:none;
+  width:23px;
+  height:23px;
+  flex:0 0 auto;
+  align-items:center;
+  justify-content:center;
+  border:1px solid rgba(255,255,255,.22);
+  background:rgba(255,255,255,.08);
+  color:#fff;
+  border-radius:999px;
+  padding:0;
+  font-size:14px;
+  line-height:1;
+  cursor:pointer;
+}
+.duty-refresh-btn.show{display:inline-flex;}
+.duty-refresh-btn:active{background:rgba(255,255,255,.18);}
+.duty-refresh-btn:disabled{opacity:.55;cursor:default;}
+.duty-refresh-btn.refreshing{animation:atlas-duty-refresh-spin .8s linear infinite;}
+@keyframes atlas-duty-refresh-spin{to{transform:rotate(360deg);}}
+@media (max-width:520px){
+  .status-refresh-row{gap:3px;}
+  .duty-refresh-btn{width:21px;height:21px;font-size:13px;}
+}
 </style>
 
 </head>
@@ -820,7 +852,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · FULL REST TEST 0.10.2</span>
+      <span class="rest-beta-env-badge">DEV BETA · DUTY MANUAL REFRESH 0.11.4</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <div class="date-status-stack">
@@ -828,7 +860,10 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
           <span class="date-pill" id="datePill">–</span>
           <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="テーマ切り替え"></button>
         </div>
-        <div class="conn-banner compact-status" id="connBanner"><span class="conn-dot"></span><span id="connBannerText">同期中</span></div>
+        <div class="status-refresh-row">
+          <div class="conn-banner compact-status" id="connBanner"><span class="conn-dot"></span><span id="connBannerText">同期中</span></div>
+          <button class="duty-refresh-btn" id="dutyRefreshBtn" type="button" aria-label="当番管理を更新" title="当番管理を更新">↻</button>
+        </div>
       </div>
     </div>
   </div>
@@ -3361,7 +3396,7 @@ function atlasDiagText(){
   const safari=(ua.match(/Version\/([\d.]+)/)||[])[1]||"—";
   const webkit=(ua.match(/AppleWebKit\/([\d.]+)/)||[])[1]||"—";
   const rows=[
-    "環境: ATLAS REST BETA TEST 0.11.3 / STATUS POSITION FIX",
+    "環境: ATLAS REST BETA TEST 0.11.4 / DUTY MANUAL REFRESH",
     "Firebase project: "+(firebaseConfig.projectId||"—"),
     "環境ガード: "+(firebaseConfig.projectId===EXPECTED_FIREBASE_PROJECT_ID?"OK":"BLOCK"),
     "通信: "+(navigator.onLine?"オンライン":"オフライン"),
@@ -4780,6 +4815,8 @@ document.getElementById("modeSwitch").addEventListener("click", async (e)=>{
   document.getElementById("dutyModeHeader").style.display = isDuty ? "" : "none";
   document.getElementById("main").style.display = isDuty ? "none" : "";
   document.getElementById("dutyMain").style.display = isDuty ? "" : "none";
+  const dutyRefreshBtn = document.getElementById("dutyRefreshBtn");
+  if(dutyRefreshBtn) dutyRefreshBtn.classList.toggle("show", isDuty);
   if(isDuty){ await renderDutyPanel(); }
 });
 document.getElementById("dutySubNav").addEventListener("click", async (e)=>{
@@ -4790,6 +4827,28 @@ document.getElementById("dutySubNav").addEventListener("click", async (e)=>{
   dutySub = btn.getAttribute("data-dsub");
   await renderDutyPanel();
 });
+
+/* 0.11.4: 当番管理は定期ポーリングを行わず、明示的な↻操作で現在のサブページを再取得する。 */
+const dutyRefreshBtn = document.getElementById("dutyRefreshBtn");
+if(dutyRefreshBtn){
+  dutyRefreshBtn.addEventListener("click", async ()=>{
+    if(dutyRefreshBtn.disabled) return;
+    dutyRefreshBtn.disabled = true;
+    dutyRefreshBtn.classList.add("refreshing");
+    setAtlasConnState(navigator.onLine ? "syncing" : "offline");
+    try{
+      await renderDutyPanel();
+      if(navigator.onLine) atlasMarkSyncSuccess();
+      showToast("当番管理を更新しました");
+    }catch(e){
+      flashConnError("当番管理の更新に失敗しました");
+      showToast("当番管理を更新できませんでした");
+    }finally{
+      dutyRefreshBtn.classList.remove("refreshing");
+      dutyRefreshBtn.disabled = false;
+    }
+  });
+}
 
 /* =========================================================================
    苗テラス 記録シート（朝: 管理簿 / 昼: 培養液記録シート）
