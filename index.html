@@ -852,7 +852,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · SENTINEL v0.4 SHARED 1M · DUTY MANUAL REFRESH 0.11.4</span>
+      <span class="rest-beta-env-badge">DEV BETA · SENTINEL v0.4 SHARED 1M SAFE · DUTY MANUAL REFRESH 0.11.4</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <div class="date-status-stack">
@@ -3875,7 +3875,12 @@ function sentinelSharedEnsureMinuteBaseline(){
   // Baseline the current 1-minute snapshot once, so historical counts are not resent/double-counted.
   try{
     const raw=localStorage.getItem(SENTINEL_SHARED_STATE_KEY);
-    if(raw)return;
+    if(raw){
+      try{
+        const parsed=JSON.parse(raw);
+        if(parsed && parsed.version===SENTINEL_SHARED_VERSION && parsed.sent) return;
+      }catch(_){}
+    }
     const baseline=sentinelSharedAggregateLocal();
     sentinelSharedSaveState({
       version:SENTINEL_SHARED_VERSION,
@@ -3927,6 +3932,34 @@ function sentinelSharedDocName(date){
 function sentinelSharedIncrementTransform(fieldPath,n){
   return {fieldPath,increment:{integerValue:String(Math.max(0,Math.trunc(Number(n)||0)))}};
 }
+const SENTINEL_SHARED_MAX_TRANSFORMS_PER_COMMIT = 400;
+
+function sentinelSharedChunkBuckets(bucketDeltas){
+  // Firestore has a per-document transform ceiling. Keep comfortable headroom
+  // for daily totals + lastSeen by limiting each commit to <=400 transforms.
+  const chunks=[];
+  let chunk={},used=0;
+  for(const [bucket,d] of Object.entries(bucketDeltas).sort((a,b)=>a[0].localeCompare(b[0]))){
+    const cost=(d.reads?1:0)+(d.writes?1:0)+(d.deletes?1:0);
+    if(used && used+cost+4>SENTINEL_SHARED_MAX_TRANSFORMS_PER_COMMIT){
+      chunks.push(chunk);chunk={};used=0;
+    }
+    chunk[bucket]=d;used+=cost;
+  }
+  if(Object.keys(chunk).length)chunks.push(chunk);
+  return chunks;
+}
+function sentinelSharedApplyChunkToState(state,date,chunk,currentDay){
+  const sentDay=state.sent[date]||(state.sent[date]={});
+  Object.keys(chunk).forEach(bucket=>{
+    // Persist the exact local cumulative value represented by this successful chunk.
+    // A later retry therefore calculates only genuinely unsent positive deltas.
+    sentDay[bucket]=JSON.parse(JSON.stringify(currentDay[bucket]||{reads:0,writes:0,deletes:0}));
+  });
+  state.version=SENTINEL_SHARED_VERSION;
+  state.lastSuccessfulChunkAt=Date.now();
+  sentinelSharedSaveState(state);
+}
 async function sentinelSharedCommitDay(date,bucketDeltas){
   const headers=await sentinelSharedHeaders();
   const docName=sentinelSharedDocName(date);
@@ -3943,6 +3976,9 @@ async function sentinelSharedCommitDay(date,bucketDeltas){
   if(dayW)transforms.push(sentinelSharedIncrementTransform("writes",dayW));
   if(dayD)transforms.push(sentinelSharedIncrementTransform("deletes",dayD));
   transforms.push({fieldPath:"lastSeen",setToServerValue:"REQUEST_TIME"});
+  if(transforms.length>SENTINEL_SHARED_MAX_TRANSFORMS_PER_COMMIT){
+    throw new Error(`SENTINEL shared safety guard: ${transforms.length} transforms exceeds ${SENTINEL_SHARED_MAX_TRANSFORMS_PER_COMMIT}`);
+  }
   const write={
     update:{
       name:docName,
@@ -3968,13 +4004,17 @@ async function sentinelSharedCommitDay(date,bucketDeltas){
 async function sentinelSharedFlush(){
   if(sentinelSharedBusy)return false;
   sentinelSharedBusy=true;
+  let writes=0;
   try{
-    const {plan,state,current}=sentinelSharedDeltaPlan();
-    let writes=0;
+    const {plan,state}=sentinelSharedDeltaPlan();
     for(const item of plan){
-      await sentinelSharedCommitDay(item.date,item.buckets);
-      state.sent[item.date]=JSON.parse(JSON.stringify(item.current));
-      writes++;
+      const chunks=sentinelSharedChunkBuckets(item.buckets);
+      for(const chunk of chunks){
+        await sentinelSharedCommitDay(item.date,chunk);
+        writes++;
+        // Critical: checkpoint after EVERY successful commit, not after the whole flush.
+        sentinelSharedApplyChunkToState(state,item.date,chunk,item.current);
+      }
     }
     const cutoff=Date.now()-9*24*60*60*1000;
     Object.keys(state.sent).forEach(date=>{
@@ -3985,7 +4025,9 @@ async function sentinelSharedFlush(){
     sentinelSharedLastStatus={ok:true,at:Date.now(),error:"",writes};
     return true;
   }catch(e){
-    sentinelSharedLastStatus={ok:false,at:Date.now(),error:e&&e.message?e.message:String(e),writes:0};
+    // Successful earlier chunks have already been checkpointed, so retry is idempotent
+    // with respect to those chunks and cannot double-add them.
+    sentinelSharedLastStatus={ok:false,at:Date.now(),error:e&&e.message?e.message:String(e),writes};
     console.warn("[SENTINEL] shared sync failed",e);
     return false;
   }finally{
