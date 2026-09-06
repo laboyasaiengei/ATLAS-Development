@@ -852,7 +852,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
       </div>
     </div>
     <div class="brand-controls">
-      <span class="rest-beta-env-badge">DEV BETA · SENTINEL v0.3 SHARED · DUTY MANUAL REFRESH 0.11.4</span>
+      <span class="rest-beta-env-badge">DEV BETA · SENTINEL v0.4 SHARED 1M · DUTY MANUAL REFRESH 0.11.4</span>
       <span class="atlas-write-auth-badge" id="atlasWriteAuthBadge">書込認証準備中</span>
       <button class="dev-diag-btn" id="devDiagBtn" type="button">DEV診断</button>
       <div class="date-status-stack">
@@ -3786,18 +3786,19 @@ window.SENTINEL_ATLAS_DEV={
 
 
 /* ==================================================================
-   SENTINEL Shared Sync v0.3
+   SENTINEL Shared Sync v0.4 · 1-minute buckets / 10-minute flush
    Shared sink: Dev-CAESAR Firestore (anonymous auth + App Check)
    - local Telemetry v0.2 remains the source of truth on this device
+   - local telemetry is exported as 1-minute buckets
    - every 10 minutes, only positive unsent deltas are atomically incremented
    - one shared Firestore document per app / Pacific-Time date
    - direct fetch is used so telemetry transport does NOT count itself
    ================================================================== */
-const SENTINEL_SHARED_VERSION = "0.3";
+const SENTINEL_SHARED_VERSION = "0.4";
 const SENTINEL_SHARED_APP_ID = "atlas-dev";
 const SENTINEL_SHARED_SYNC_MS = 10*60*1000;
 const SENTINEL_SHARED_COLLECTION = "sentinelTelemetryDaily";
-const SENTINEL_SHARED_STATE_KEY = "sentinelShared.v0.3.atlas-dev";
+const SENTINEL_SHARED_STATE_KEY = "sentinelShared.v0.4.atlas-dev";
 
 const SENTINEL_SHARED_FIREBASE_CONFIG = {
   apiKey: "AIzaSyCZOI7sTRGn2xw6VWPkXblb8KW4TM_BcwU",
@@ -3868,6 +3869,24 @@ function sentinelSharedDeltaPlan(){
   });
   return {plan,state,current};
 }
+function sentinelSharedEnsureMinuteBaseline(){
+  // v0.4 migration guard:
+  // Existing local telemetry may already have been exported by v0.3 as 10-minute buckets.
+  // Baseline the current 1-minute snapshot once, so historical counts are not resent/double-counted.
+  try{
+    const raw=localStorage.getItem(SENTINEL_SHARED_STATE_KEY);
+    if(raw)return;
+    const baseline=sentinelSharedAggregateLocal();
+    sentinelSharedSaveState({
+      version:SENTINEL_SHARED_VERSION,
+      sent:JSON.parse(JSON.stringify(baseline)),
+      minuteBaselineAt:Date.now()
+    });
+  }catch(e){
+    console.warn("[SENTINEL] minute baseline init skipped",e);
+  }
+}
+
 function sentinelSharedGetFirebaseApp(){
   if(sentinelSharedFirebaseApp) return sentinelSharedFirebaseApp;
   const existing=(firebase.apps||[]).find(a=>a.name==="sentinel-shared");
@@ -3916,9 +3935,9 @@ async function sentinelSharedCommitDay(date,bucketDeltas){
   Object.entries(bucketDeltas).forEach(([bucket,d])=>{
     const r=Number(d.reads)||0,w=Number(d.writes)||0,x=Number(d.deletes)||0;
     dayR+=r;dayW+=w;dayD+=x;
-    if(r)transforms.push(sentinelSharedIncrementTransform(`r_${bucket}`,r));
-    if(w)transforms.push(sentinelSharedIncrementTransform(`w_${bucket}`,w));
-    if(x)transforms.push(sentinelSharedIncrementTransform(`d_${bucket}`,x));
+    if(r)transforms.push(sentinelSharedIncrementTransform(`r1_${bucket}`,r));
+    if(w)transforms.push(sentinelSharedIncrementTransform(`w1_${bucket}`,w));
+    if(x)transforms.push(sentinelSharedIncrementTransform(`d1_${bucket}`,x));
   });
   if(dayR)transforms.push(sentinelSharedIncrementTransform("reads",dayR));
   if(dayW)transforms.push(sentinelSharedIncrementTransform("writes",dayW));
@@ -3986,6 +4005,7 @@ window.SENTINEL_SHARED={
   status:()=>({...sentinelSharedLastStatus}),
   plan:()=>sentinelSharedDeltaPlan().plan
 };
+sentinelSharedEnsureMinuteBaseline();
 setTimeout(()=>sentinelSharedFlush().finally(sentinelSharedSchedule),15000);
 document.addEventListener("visibilitychange",()=>{
   if(document.visibilityState==="visible" && Date.now()-(sentinelSharedLastStatus.at||0)>SENTINEL_SHARED_SYNC_MS){
