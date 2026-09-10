@@ -3611,46 +3611,56 @@ document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 const ATLAS_REST_MAINLINE_VERSION = "0.10.2";
 
 /* ==================================================================
-   Persistent Diagnostic Log v0.1 (local only / no user-entered data)
-   Records: time, app version, online state, HTTP status, category, location.
+   Central Diagnostic Reporter v0.2
+   Local fallback + SENTINEL shared error reporting.
+   No user-entered task/name/content is transmitted.
    ================================================================== */
-const ATLAS_DIAG_LOG_VERSION="0.1";
-const ATLAS_DIAG_LOG_KEY="atlasDiagnosticLog.v0.1";
+const ATLAS_DIAG_LOG_VERSION="0.2";
+const ATLAS_DIAG_LOG_KEY="atlasDiagnosticLog.v0.2";
 const ATLAS_DIAG_LOG_LIMIT=200;
+const SENTINEL_DIAG_COLLECTION="sentinelDiagnostics";
+const SENTINEL_DIAG_APP_ID="atlas-dev";
+const SENTINEL_DIAG_DEDUPE_MS=60*1000;
+const SENTINEL_DIAG_MAX_PER_10MIN=10;
+let atlasDiagRecent=[];
 function atlasDiagLogLoad(){try{const x=JSON.parse(localStorage.getItem(ATLAS_DIAG_LOG_KEY)||"[]");return Array.isArray(x)?x:[]}catch(_){return []}}
+function atlasDiagSafeDetail(category,detail){
+  if(category==="http-error")return String(detail||"").toUpperCase().slice(0,12);
+  if(category==="network-error")return "fetch-failed";
+  if(category==="javascript-error")return "runtime-exception";
+  if(category==="promise-rejection")return "promise-rejection";
+  if(category==="connection")return detail==="offline"?"offline":"online";
+  if(category==="self-test")return "diagnostic-test";
+  return "";
+}
+function atlasDiagShouldRemote(category){return ["http-error","network-error","javascript-error","promise-rejection","connection","self-test"].includes(category)}
 function atlasDiagLogRecord(category,location,status,detail){
-  try{
-    const rows=atlasDiagLogLoad();
-    rows.push({time:new Date().toISOString(),appVersion:(typeof ATLAS_REST_MAINLINE_VERSION!=="undefined"?ATLAS_REST_MAINLINE_VERSION:"dev-beta"),online:navigator.onLine!==false,status:status==null?null:Number(status),category:String(category||"unknown").slice(0,40),location:String(location||"unknown").slice(0,80),detail:String(detail||"").slice(0,160)});
-    localStorage.setItem(ATLAS_DIAG_LOG_KEY,JSON.stringify(rows.slice(-ATLAS_DIAG_LOG_LIMIT)));
-  }catch(_){}
+  const row={time:new Date().toISOString(),appVersion:(typeof ATLAS_REST_MAINLINE_VERSION!=="undefined"?ATLAS_REST_MAINLINE_VERSION:"dev-beta"),online:navigator.onLine!==false,status:status==null?null:Number(status),category:String(category||"unknown").slice(0,40),location:String(location||"unknown").slice(0,80),detail:atlasDiagSafeDetail(category,detail)};
+  try{const rows=atlasDiagLogLoad();rows.push(row);localStorage.setItem(ATLAS_DIAG_LOG_KEY,JSON.stringify(rows.slice(-ATLAS_DIAG_LOG_LIMIT)))}catch(_){}
+  if(atlasDiagShouldRemote(row.category))setTimeout(()=>atlasDiagReportRemote(row).catch(()=>{}),0);
 }
-function atlasDiagLogText(){
-  const rows=atlasDiagLogLoad().slice(-40).reverse();
-  if(!rows.length)return "記録なし";
-  return rows.map(r=>`${r.time} | v${r.appVersion} | ${r.online?"online":"offline"} | ${r.status==null?"—":r.status} | ${r.category} | ${r.location}${r.detail?" | "+r.detail:""}`).join("\\n");
-}
+function atlasDiagLogText(){const rows=atlasDiagLogLoad().slice(-40).reverse();if(!rows.length)return "記録なし";return rows.map(r=>`${r.time} | v${r.appVersion} | ${r.online?"online":"offline"} | ${r.status==null?"—":r.status} | ${r.category} | ${r.location}${r.detail?" | "+r.detail:""}`).join("\\n")}
 function atlasDiagUrlLocation(url){try{const u=new URL(String(url),location.href);if(u.hostname.includes("firestore.googleapis.com"))return "Firestore REST";if(u.hostname.includes("identitytoolkit.googleapis.com"))return "Firebase Auth";if(u.hostname.includes("securetoken.googleapis.com"))return "Firebase Token";return "network"}catch(_){return "network"}}
-(function(){
-  const originalFetch=window.fetch;
-  window.fetch=async function(input,init){
-    const url=typeof input==="string"?input:(input&&input.url)||"";
-    try{
-      const res=await originalFetch.apply(this,arguments);
-      if(!res.ok && /googleapis\\.com|firebase/i.test(url)) atlasDiagLogRecord("http-error",atlasDiagUrlLocation(url),res.status,(init&&init.method)||"GET");
-      return res;
-    }catch(e){
-      if(/googleapis\\.com|firebase/i.test(url)) atlasDiagLogRecord("network-error",atlasDiagUrlLocation(url),null,e&&e.name||"fetch failed");
-      throw e;
-    }
-  };
-})();
-window.addEventListener("error",e=>atlasDiagLogRecord("javascript-error","window",null,e&&e.message||"error"));
-window.addEventListener("unhandledrejection",e=>atlasDiagLogRecord("promise-rejection","window",null,e&&e.reason&&e.reason.message||String(e&&e.reason||"rejection")));
+async function atlasDiagReportRemote(row){
+  const now=Date.now(),sig=`${row.category}|${row.location}|${row.status??""}`;
+  atlasDiagRecent=atlasDiagRecent.filter(x=>now-x.t<10*60*1000);
+  if(atlasDiagRecent.some(x=>x.sig===sig&&now-x.t<SENTINEL_DIAG_DEDUPE_MS))return;
+  if(atlasDiagRecent.length>=SENTINEL_DIAG_MAX_PER_10MIN)return;
+  atlasDiagRecent.push({t:now,sig});
+  const headers=await sentinelSharedHeaders();
+  const id=`${SENTINEL_DIAG_APP_ID}_${now}_${Math.random().toString(36).slice(2,8)}`;
+  const base=`https://firestore.googleapis.com/v1/projects/${SENTINEL_SHARED_FIREBASE_CONFIG.projectId}/databases/(default)/documents/${SENTINEL_DIAG_COLLECTION}`;
+  const fields={appId:{stringValue:SENTINEL_DIAG_APP_ID},occurredAt:{timestampValue:row.time},appVersion:{stringValue:String(row.appVersion)},online:{booleanValue:!!row.online},category:{stringValue:row.category},location:{stringValue:row.location},detail:{stringValue:row.detail||""}};
+  if(row.status!=null)fields.httpStatus={integerValue:String(Math.trunc(row.status))};
+  window.__atlasDiagSending=true;
+  try{const res=await fetch(`${base}?documentId=${encodeURIComponent(id)}`,{method:"POST",headers,body:JSON.stringify({fields}),cache:"no-store"});if(!res.ok)throw new Error(`diag HTTP ${res.status}`)}finally{window.__atlasDiagSending=false}
+}
+(function(){const originalFetch=window.fetch;window.fetch=async function(input,init){const url=typeof input==="string"?input:(input&&input.url)||"";try{const res=await originalFetch.apply(this,arguments);if(!window.__atlasDiagSending&&!res.ok&&/googleapis\\.com|firebase/i.test(url))atlasDiagLogRecord("http-error",atlasDiagUrlLocation(url),res.status,(init&&init.method)||"GET");return res}catch(e){if(!window.__atlasDiagSending&&/googleapis\\.com|firebase/i.test(url))atlasDiagLogRecord("network-error",atlasDiagUrlLocation(url),null,"fetch-failed");throw e}}})();
+window.addEventListener("error",e=>atlasDiagLogRecord("javascript-error","window",null,"runtime-exception"));
+window.addEventListener("unhandledrejection",()=>atlasDiagLogRecord("promise-rejection","window",null,"promise-rejection"));
 window.addEventListener("online",()=>atlasDiagLogRecord("connection","browser",null,"online"));
 window.addEventListener("offline",()=>atlasDiagLogRecord("connection","browser",null,"offline"));
-atlasDiagLogRecord("startup","application",null,"diagnostic logger ready");
-window.ATLAS_DIAGNOSTIC_LOG={list:atlasDiagLogLoad,text:atlasDiagLogText,clear:()=>localStorage.removeItem(ATLAS_DIAG_LOG_KEY),test:()=>atlasDiagLogRecord("self-test","local",200,"no network")};
+window.ATLAS_DIAGNOSTIC_LOG={list:atlasDiagLogLoad,text:atlasDiagLogText,clear:()=>localStorage.removeItem(ATLAS_DIAG_LOG_KEY),test:()=>atlasDiagLogRecord("self-test","local",200,"diagnostic-test")};
 
 const REST_READ_TIMEOUT_MS = 12000;
 let atlasAppCheckReady=false;
