@@ -3608,7 +3608,8 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_REST_MAINLINE_VERSION = "0.10.2";
+const ATLAS_APP_VERSION = "0.10.2";
+const ATLAS_REST_MAINLINE_VERSION = ATLAS_APP_VERSION;
 
 /* ==================================================================
    Central Diagnostic Reporter v0.2
@@ -3635,7 +3636,7 @@ function atlasDiagSafeDetail(category,detail){
 }
 function atlasDiagShouldRemote(category){return ["http-error","network-error","javascript-error","promise-rejection","connection","self-test"].includes(category)}
 function atlasDiagLogRecord(category,location,status,detail){
-  const row={time:new Date().toISOString(),appVersion:(typeof ATLAS_REST_MAINLINE_VERSION!=="undefined"?ATLAS_REST_MAINLINE_VERSION:"dev-beta"),online:navigator.onLine!==false,status:status==null?null:Number(status),category:String(category||"unknown").slice(0,40),location:String(location||"unknown").slice(0,80),detail:atlasDiagSafeDetail(category,detail)};
+  const row={time:new Date().toISOString(),appVersion:(typeof ATLAS_APP_VERSION!=="undefined"?ATLAS_APP_VERSION:"dev-beta"),online:navigator.onLine!==false,status:status==null?null:Number(status),category:String(category||"unknown").slice(0,40),location:String(location||"unknown").slice(0,80),detail:atlasDiagSafeDetail(category,detail)};
   try{const rows=atlasDiagLogLoad();rows.push(row);localStorage.setItem(ATLAS_DIAG_LOG_KEY,JSON.stringify(rows.slice(-ATLAS_DIAG_LOG_LIMIT)))}catch(_){}
   if(atlasDiagShouldRemote(row.category))setTimeout(()=>atlasDiagReportRemote(row).catch(()=>{}),0);
 }
