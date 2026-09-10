@@ -1074,6 +1074,7 @@ html[data-theme="dark"] .theme-toggle::before{ content:"☀️"; }
     <div class="dev-diag-sub">Developer Beta / REST実験経路の状態確認</div>
     <div class="dev-diag-pre" id="devDiagBody">診断情報を準備中…</div>
     <div class="dev-diag-actions">
+      <button id="devDiagTest" type="button">エラー通報テスト</button>
       <button id="devDiagRefresh" type="button">更新</button>
       <button id="devDiagCopy" type="button">コピー</button>
       <button id="devDiagClose" type="button">閉じる</button>
@@ -3594,10 +3595,18 @@ function updateAtlasWriteAuthBadge(){
 function initAtlasDevDiagUI(){
   const btn=document.getElementById("devDiagBtn");
   const modal=document.getElementById("devDiagModal");
+  const test=document.getElementById("devDiagTest");
   const refresh=document.getElementById("devDiagRefresh");
   const copy=document.getElementById("devDiagCopy");
   const close=document.getElementById("devDiagClose");
   if(btn) btn.addEventListener("click",()=>{renderAtlasDevDiag();modal&&modal.classList.add("show");});
+  if(test) test.addEventListener("click",()=>{
+    if(window.ATLAS_DIAGNOSTIC_LOG&&typeof window.ATLAS_DIAGNOSTIC_LOG.test==="function"){
+      window.ATLAS_DIAGNOSTIC_LOG.test();
+      if(typeof showToast==="function") showToast("SENTINELへテスト通報しました");
+      setTimeout(renderAtlasDevDiag,150);
+    }
+  });
   if(refresh) refresh.addEventListener("click",renderAtlasDevDiag);
   if(close) close.addEventListener("click",()=>modal&&modal.classList.remove("show"));
   if(copy) copy.addEventListener("click",async()=>{
