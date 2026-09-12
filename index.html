@@ -3617,7 +3617,7 @@ function initAtlasDevDiagUI(){
 }
 document.addEventListener("DOMContentLoaded",initAtlasDevDiagUI);
 
-const ATLAS_APP_VERSION = "0.10.2";
+const ATLAS_APP_VERSION = "0.10.3";
 const ATLAS_REST_MAINLINE_VERSION = ATLAS_APP_VERSION;
 
 /* ==================================================================
@@ -4991,10 +4991,39 @@ function monthDates(year,month){ // month: 0-11
   return { first, list };
 }
 
+/* ---- 当番管理: 初回表示時にだけ関連データをまとめて取得 ----
+   roster / adminPassword(adminPasswordCurrent) / prefDeadline は当番管理内
+   でしか参照されないため、栽培管理しか使わないユーザーではFirestoreの
+   読み取りを一切発生させない。
+   （specialDates・restorePasscodeCurrentは栽培管理側（当番バナー／復元）
+     でも使うため、こちらには含めず従来通り起動時の初期読込のまま） */
+let atlasDutyDataLoaded = false;
+let atlasDutyDataLoadingPromise = null;
+function ensureDutyDataLoaded(){
+  if(atlasDutyDataLoaded) return Promise.resolve();
+  if(atlasDutyDataLoadingPromise) return atlasDutyDataLoadingPromise;
+  atlasDutyDataLoadingPromise = Promise.all([
+    loadRoster(),
+    loadAdminPassword(),
+    loadPrefDeadline()
+  ]).then(()=>{
+    atlasDutyDataLoaded = true;
+  }).finally(()=>{
+    atlasDutyDataLoadingPromise = null;
+  });
+  return atlasDutyDataLoadingPromise;
+}
+
 /* ---- 当番管理: 全体の描画振り分け ---- */
 let dutySub = "pref";
 async function renderDutyPanel(){
   const el = document.getElementById("dutyMain");
+  if(!atlasDutyDataLoaded){
+    // 当番管理を初めて開いた時だけ発生するデータ取得。一瞬空白になるのを避け、
+    // 他のパネル読み込みと同じ「読み込み中…」表示を出しておく。
+    el.innerHTML = `<div class="empty-note">読み込み中…</div>`;
+  }
+  await ensureDutyDataLoaded();
   const topActions = document.getElementById("dutyTopActions");
   if(topActions) topActions.style.display = isAdmin ? "" : "none";
   if(dutySub==="pref"){
@@ -5943,7 +5972,12 @@ document.getElementById("closeBaiyoekiModal").addEventListener("click", ()=>{
         setupConnectionBanner();
         atlasBootMark("connection banner設定完了");
         setLoadingStep("各種データを読み込み中…" + attemptTag);
-        await atlasBootMeasure("初期設定5系統読込", ()=>Promise.all([loadRoster(), loadSpecialDates(), loadAdminPassword(), loadRestorePasscode(), loadPrefDeadline()]));
+        // 当番管理専用のroster/adminPassword/prefDeadlineは、当番管理を開く際に
+        // ensureDutyDataLoaded()でまとめて取得する（栽培管理のみのユーザーの
+        // Firestore読み取りを削減するため）。
+        // specialDates（栽培管理の「今日の当番」バナー判定用）とrestorePasscode
+        // （栽培管理の「復元」ボタン用）は栽培管理でも必要なため、従来通り初期化時に取得する。
+        await atlasBootMeasure("初期設定2系統読込", ()=>Promise.all([loadSpecialDates(), loadRestorePasscode()]));
         if(settled) return;
         setLoadingStep("画面を準備中…" + attemptTag);
         await atlasBootMeasure("初期タブloadTab("+currentTab+")", ()=>loadTab(currentTab));
